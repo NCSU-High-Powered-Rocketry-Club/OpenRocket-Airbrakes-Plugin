@@ -1,0 +1,86 @@
+plugins {
+    id 'java'
+    // For creating a "fat JAR" that includes dependencies:
+    id 'com.github.johnrengelman.shadow' version '7.1.2' // Check for the latest version
+}
+
+// Diagnostic check for OpenRocket JAR
+// This code runs during Gradle's configuration phase.
+// It checks if the JAR file is found at the expected path relative to the project root.
+def openRocketJarPath = 'libs/OpenRocket-23.09.jar'
+def openRocketJarFileForCheck = file(openRocketJarPath) // 'file()' resolves against project directory. Renamed variable for clarity.
+
+if (!openRocketJarFileForCheck.exists()) {
+    println "------------------------------------------------------------------------------------"
+    println "ERROR (Gradle Build): OpenRocket JAR file NOT FOUND by Gradle at expected location!"
+    println "Expected path: ${openRocketJarFileForCheck.absolutePath}"
+    println "Please ensure:"
+    println "1. The 'libs' folder exists directly under your project root: ${project.projectDir}/libs"
+    println "2. The JAR file is named EXACTLY 'OpenRocket-24.12.RC.01.jar' (case-sensitive)."
+    println "3. The JAR file is placed inside the 'libs' folder."
+    println "Build is likely to fail due to missing OpenRocket classes."
+    println "------------------------------------------------------------------------------------"
+    // You could even make the build fail early here if desired:
+    // throw new GradleException("OpenRocket JAR not found at ${openRocketJarFileForCheck.absolutePath}. Halting build.")
+} else {
+    println "------------------------------------------------------------------------------------"
+    println "SUCCESS (Gradle Build): OpenRocket JAR file FOUND by Gradle at (checked path):"
+    println "${openRocketJarFileForCheck.absolutePath}"
+    println "------------------------------------------------------------------------------------"
+}
+
+
+group = 'com.airbrakesplugin' // Changed to match new package
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+    // Tell Gradle to look in the 'libs' directory for JAR files.
+    // This 'libs' folder must be in the SAME directory as this build.gradle file.
+    // e.g., C:\SchoolStuff\7th - 8th Senior Design\Airbrakes Plugin\Attempt #3\libs\
+    flatDir {
+        dirs 'libs'
+    }
+}
+
+dependencies {
+    // --- OpenRocket Core Dependency ---
+    // CRITICAL: Ensure the file 'OpenRocket-24.12.RC.01.jar'
+    // is located EXACTLY at: YourProjectRoot/libs/OpenRocket-24.12.RC.01.jar
+    // Using a direct string path here for the dependency declaration.
+    compileOnly files('libs/OpenRocket-23.09.jar')
+
+    // --- Apache Commons Math for Interpolation ---
+    implementation 'org.apache.commons:commons-math3:3.6.1'
+
+    // --- Apache Commons CSV for CSV Parsing ---
+    implementation 'org.apache.commons:commons-csv:1.10.0' // Check for latest version
+
+    // --- SLF4J for logging (optional but good practice) ---
+    implementation 'org.slf4j:slf4j-api:2.0.7'
+    // Add a logging implementation, e.g., Logback or SLF4J Simple
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.7'
+
+
+    // --- JUnit for testing (recommended) ---
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8 // OpenRocket is often compatible with Java 8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+// If using the Shadow plugin to create a fat JAR:
+shadowJar {
+    archiveBaseName.set('AirbrakePlugin')
+    archiveClassifier.set('') // To avoid '-all' suffix if not desired
+    archiveVersion.set(project.version.toString())
+    // You might need to configure merging strategies for manifest files if conflicts arise
+}
+
+// Task to run tests
+test {
+    useJUnitPlatform()
+}
