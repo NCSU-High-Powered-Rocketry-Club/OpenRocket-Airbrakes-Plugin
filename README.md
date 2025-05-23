@@ -1,5 +1,1 @@
-# OpenRocket-Airbrakes-Plugin
-<<<<<<< HEAD
-Here lies the development of an Airbrakes Plugin for Openrocket that takes in a .csv of CFD data for a given airbrakes configureation and adds that to the flight simulation tab
-=======
->>>>>>> f16ac2c (The first push)
+Here lies an openrocket plugin that intends to simulate airbrakes deploying to obtain a specific height for a rocket. The plugin is based around a .csv file of CFD Data that the user puts into the plugin for their airbrakes config
