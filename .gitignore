@@ -1,0 +1,5 @@
+.gradle/                       # Gradle cache
+build/                         # Gradle build output
+!gradle/wrapper/gradle-wrapper.jar
+.vscode/ 
+README.md
