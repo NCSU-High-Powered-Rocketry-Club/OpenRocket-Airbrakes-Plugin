@@ -52,9 +52,8 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
             config = new AirbrakeConfig();
         }
         log.info("Registering AirbrakeSimulationListener with config: {}", config);
-        // This is the ONLY place you add your listener:
         conditions.getSimulationListenerList()
-                  .add((SimulationListener) new AirbrakeSimulationListener(config, conditions.getRocket()));
+                  .add((SimulationListener)new AirbrakeSimulationListener(config, conditions.getRocket()));
     }
 
     /* ------------------------------------------------------------------ */
@@ -62,17 +61,59 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     /* ------------------------------------------------------------------ */
     public void setConfig(AirbrakeConfig config) {
         this.config = config;
+        fireChangeEvent();
     }
 
-    public String getCfdDataFilePath()        { return config.getCfdDataFilePath(); }
-    public void   setCfdDataFilePath(String p){ config.setCfdDataFilePath(p); }
+    /** Path to the CFD data CSV. */
+    public String getCfdDataFilePath() {
+        return config.getCfdDataFilePath();
+    }
 
-    public double getReferenceArea()          { return config.getReferenceArea(); }
-    public void   setReferenceArea(double a)  { config.setReferenceArea(a); }
+    public void setCfdDataFilePath(String path) {
+        config.setCfdDataFilePath(path);
+        fireChangeEvent();
+    }
 
-    public double getReferenceLength()        { return config.getReferenceLength(); }
-    public void   setReferenceLength(double l){ config.setReferenceLength(l); }
+    /** Airbrake reference surface area (m²). */
+    public double getReferenceArea() {
+        return config.getReferenceArea();
+    }
 
-    public double getMaxDeploymentRate()      { return config.getMaxDeploymentRate(); }
-    public void   setMaxDeploymentRate(double r){ config.setMaxDeploymentRate(r); }
+    public void setReferenceArea(double area) {
+        config.setReferenceArea(area);
+        fireChangeEvent();
+    }
+
+    /**
+     * Alias for GUI binding: DoubleModel("AirbrakeSurfaceArea")
+     * Internally stored as referenceArea in the config.
+     */
+    public double getAirbrakeSurfaceArea() {
+        return config.getReferenceArea();
+    }
+
+    public void setAirbrakeSurfaceArea(double area) {
+        config.setReferenceArea(area);
+        fireChangeEvent();
+    }
+
+    /** Reference length (m), used for the pitching moment arm. */
+    public double getReferenceLength() {
+        return config.getReferenceLength();
+    }
+
+    public void setReferenceLength(double length) {
+        config.setReferenceLength(length);
+        fireChangeEvent();
+    }
+
+    /** Maximum airbrake deployment rate (fraction of full deflection per second). */
+    public double getMaxDeploymentRate() {
+        return config.getMaxDeploymentRate();
+    }
+
+    public void setMaxDeploymentRate(double rate) {
+        config.setMaxDeploymentRate(rate);
+        fireChangeEvent();
+    }
 }
