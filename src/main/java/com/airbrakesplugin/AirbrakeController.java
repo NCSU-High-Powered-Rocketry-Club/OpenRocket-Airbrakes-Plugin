@@ -45,8 +45,13 @@ public class AirbrakeController {
             return 0.0;
         }
         
-        if (currentAltitude > config.getDeployAltitudeThreshold() && verticalVelocity > 10 && 
-            (config.getMaxMachForDeployment() <= 0 || currentMach < config.getMaxMachForDeployment())) {
+        if (config.getMaxMachForDeployment() > 0
+           && currentMach > config.getMaxMachForDeployment()) {
+            log.debug("Current Mach ({}) exceeds max deployment Mach ({}). Commanding 0% deployment.", currentMach, config.getMaxMachForDeployment());
+            return 0.0;
+        }
+        
+        if (currentAltitude > config.getDeployAltitudeThreshold() && verticalVelocity > 10 && (config.getMaxMachForDeployment() <= 0 || currentMach < config.getMaxMachForDeployment())) {
             if (config.getTargetApogee() > 0 && currentAltitude > (config.getTargetApogee() * 0.66) && verticalVelocity > 50) {
                 return 0.75; 
             } else if (verticalVelocity > 20) { 

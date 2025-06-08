@@ -1,7 +1,6 @@
 package com.airbrakesplugin;
 
 import net.sf.openrocket.aerodynamics.AerodynamicForces;
-import net.sf.openrocket.aerodynamics.FlightConditions;
 import net.sf.openrocket.rocketcomponent.Rocket;
 import net.sf.openrocket.simulation.FlightDataType;
 import net.sf.openrocket.simulation.SimulationStatus;
