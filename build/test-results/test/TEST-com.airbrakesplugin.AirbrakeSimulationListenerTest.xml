@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="AirbrakeSimulationListener contract tests" tests="3" skipped="0" failures="0" errors="0" timestamp="2025-06-09T01:32:35.503Z" hostname="BENTSPOON" time="0.176">
+  <properties/>
+  <testcase name="postAerodynamicCalculation skips update when CFD returns NaN" classname="com.airbrakesplugin.AirbrakeSimulationListenerTest" time="0.149"/>
+  <testcase name="postAerodynamicCalculation adds ΔCᴅ and ΔCᴍ to forces" classname="com.airbrakesplugin.AirbrakeSimulationListenerTest" time="0.006"/>
+  <testcase name="preStep() honours max deployment rate" classname="com.airbrakesplugin.AirbrakeSimulationListenerTest" time="0.019"/>
+  <system-out><![CDATA[21:32:35.635 [Test worker] WARN com.airbrakesplugin.AirbrakeSimulationListener - CFD returned NaN at Mach=1.2 deploy=0.8
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

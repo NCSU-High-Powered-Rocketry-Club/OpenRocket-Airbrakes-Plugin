@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.airbrakesplugin.util.BasicTest" tests="2" skipped="0" failures="0" errors="0" timestamp="2025-06-09T01:32:35.681Z" hostname="BENTSPOON" time="0.002">
+  <properties/>
+  <testcase name="simpleTest()" classname="com.airbrakesplugin.util.BasicTest" time="0.001"/>
+  <testcase name="mathTest()" classname="com.airbrakesplugin.util.BasicTest" time="0.001"/>
+  <system-out><![CDATA[Running simple test to verify test infrastructure
+Math test completed successfully
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="AirbrakeExtension contract tests" tests="2" skipped="0" failures="0" errors="0" timestamp="2025-06-09T01:32:34.576Z" hostname="BENTSPOON" time="0.921">
+  <properties/>
+  <testcase name="initialize() adds exactly one AirbrakeSimulationListener" classname="com.airbrakesplugin.AirbrakeExtensionTest" time="0.91"/>
+  <testcase name="Bean properties set → get round-trip" classname="com.airbrakesplugin.AirbrakeExtensionTest" time="0.008"/>
+  <system-out><![CDATA[21:32:35.465 [Test worker] INFO com.airbrakesplugin.AirbrakeExtension - AirbrakeExtension created with config: AirbrakeConfig{cfdDataFilePath='null', referenceArea=0.0, referenceLength=0.0, maxDeploymentRate=0.0, targetApogee=0.0, deployAltitudeThreshold=0.0, maxMachForDeployment=0.0, alwaysOpenMode=false, alwaysOpenPercent=0.4, kp=0.01, ki=4.0E-4, kd=0.04}
+21:32:35.474 [Test worker] INFO com.airbrakesplugin.AirbrakeExtension - Initializing AirbrakeExtension with config: AirbrakeConfig{cfdDataFilePath='null', referenceArea=0.0, referenceLength=0.0, maxDeploymentRate=0.0, targetApogee=0.0, deployAltitudeThreshold=0.0, maxMachForDeployment=0.0, alwaysOpenMode=false, alwaysOpenPercent=0.4, kp=0.01, ki=4.0E-4, kd=0.04}
+21:32:35.491 [Test worker] INFO com.airbrakesplugin.AirbrakeExtension - AirbrakeExtension created with config: AirbrakeConfig{cfdDataFilePath='null', referenceArea=0.0, referenceLength=0.0, maxDeploymentRate=0.0, targetApogee=0.0, deployAltitudeThreshold=0.0, maxMachForDeployment=0.0, alwaysOpenMode=false, alwaysOpenPercent=0.4, kp=0.01, ki=4.0E-4, kd=0.04}
+]]></system-out>
+  <system-err><![CDATA[WARNING: A Java agent has been loaded dynamically (C:\Users\adity\.gradle\caches\modules-2\files-2.1\net.bytebuddy\byte-buddy-agent\1.14.4\3bf5ac1104554908cc623e40e58a00be37c35f36\byte-buddy-agent-1.14.4.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future release
+]]></system-err>
+</testsuite>

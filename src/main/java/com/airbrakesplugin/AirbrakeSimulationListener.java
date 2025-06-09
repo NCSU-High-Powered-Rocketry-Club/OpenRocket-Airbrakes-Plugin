@@ -30,10 +30,8 @@ public class AirbrakeSimulationListener extends AbstractSimulationListener {
         }
         this.config = config;
         this.rocket = rocket;
-        double diameter = (config.getReferenceLength() > 0.0)
-                        ? config.getReferenceLength()
-                        : 0.16;
-        if (config.getReferenceArea() <= 0.0) {
+        double diameter = (config.getReferenceLength() > 0.0) ? config.getReferenceLength(): 0.16;
+            if (config.getReferenceArea() <= 0.0) {
             config.setReferenceArea(Math.PI * Math.pow(diameter/2.0, 2));
         }
         if (config.getReferenceLength() <= 0.0) {
@@ -66,8 +64,8 @@ public class AirbrakeSimulationListener extends AbstractSimulationListener {
         previousTime = t;
 
         double mach = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
-        double vz   = status.getRocketVelocity().z;
-        double alt  = status.getRocketPosition().z;
+        double vz = status.getRocketVelocity().z;
+        double alt = status.getRocketPosition().z;
 
         double cmd = controller.getCommandedDeployment(alt, vz, mach, currentDeployment, status);
         double maxΔ = config.getMaxDeploymentRate() * dt;

@@ -45,11 +45,10 @@ repositories {
 
 dependencies {
     // --- OpenRocket Core Dependency ---
-    // CRITICAL: Ensure the file 'OpenRocket-24.12.RC.01.jar'
-    // is located EXACTLY at: YourProjectRoot/libs/OpenRocket-24.12.RC.01.jar
-    // Using a direct string path here for the dependency declaration.
-    compileOnly files('libs/OpenRocket-23.09.jar')
-
+    // Make it testImplementation also to ensure it's available for tests
+    implementation files('libs/OpenRocket-23.09.jar')
+    testImplementation files('libs/OpenRocket-23.09.jar')
+    
     // --- Apache Commons Math for Interpolation ---
     implementation 'org.apache.commons:commons-math3:3.6.1'
 
@@ -63,13 +62,15 @@ dependencies {
 
 
     // --- JUnit for testing (recommended) ---
-    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
-    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.3.1'
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8 // OpenRocket is often compatible with Java 8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    // Update Java version to a more recent one
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
 }
 
 // If using the Shadow plugin to create a fat JAR:
@@ -82,5 +83,38 @@ shadowJar {
 
 // Task to run tests
 test {
-    useJUnitPlatform()
+    useJUnitPlatform() // Use JUnit 5 platform
+
+    // Add JVM argument to enable experimental ByteBuddy support for Java 24
+    jvmArgs = ['-Dnet.bytebuddy.experimental=true']
+    
+    // Verbose test logging
+    testLogging {
+        events "passed", "skipped", "failed", "standardOut", "standardError"
+        showExceptions true
+        showCauses true
+        showStackTraces true
+        exceptionFormat "full"
+        showStandardStreams true // Show test output
+        
+        // Log test results at the given level
+        info {
+            events = ["failed", "skipped", "passed", "standardOut", "standardError"]
+            showStandardStreams = true
+        }
+    }
+    
+    // Always run tests
+    outputs.upToDateWhen { false }
+    
+    // Print test summary
+    afterSuite { desc, result ->
+        if (desc.parent) return // Only display summary for whole test run
+        def output = "Results: ${result.resultType} " +
+                     "(${result.testCount} tests, " +
+                     "${result.successfulTestCount} passed, " +
+                     "${result.failedTestCount} failed, " +
+                     "${result.skippedTestCount} skipped)"
+        println output
+    }
 }
