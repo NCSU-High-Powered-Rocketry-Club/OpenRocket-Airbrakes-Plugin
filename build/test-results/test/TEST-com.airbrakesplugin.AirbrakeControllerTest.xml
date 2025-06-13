@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="AirbrakeController basic functionality tests" tests="2" skipped="0" failures="0" errors="0" timestamp="2025-06-09T01:32:34.545Z" hostname="BENTSPOON" time="0.021">
+<testsuite name="AirbrakeController basic functionality tests" tests="2" skipped="0" failures="0" errors="0" timestamp="2025-06-09T02:08:58.644Z" hostname="BENTSPOON" time="0.02">
   <properties/>
-  <testcase name="Should return fixed percentage when in always-open mode" classname="com.airbrakesplugin.AirbrakeControllerTest" time="0.019"/>
+  <testcase name="Should return fixed percentage when in always-open mode" classname="com.airbrakesplugin.AirbrakeControllerTest" time="0.018"/>
   <testcase name="Should return zero deployment when vZ is zero or negative" classname="com.airbrakesplugin.AirbrakeControllerTest" time="0.001"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>

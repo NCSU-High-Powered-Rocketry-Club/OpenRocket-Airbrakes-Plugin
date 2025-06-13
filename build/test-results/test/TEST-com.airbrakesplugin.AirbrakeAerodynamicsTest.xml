@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="AirbrakeAerodynamics basic contract tests" tests="3" skipped="0" failures="0" errors="0" timestamp="2025-06-09T01:32:34.488Z" hostname="BENTSPOON" time="0.05">
+<testsuite name="AirbrakeAerodynamics basic contract tests" tests="3" skipped="0" failures="0" errors="0" timestamp="2025-06-09T02:08:58.585Z" hostname="BENTSPOON" time="0.052">
   <properties/>
   <testcase name="Constructor rejects blank path" classname="com.airbrakesplugin.AirbrakeAerodynamicsTest" time="0.017"/>
-  <testcase name="Loads CSV and echoes grid-point values correctly" classname="com.airbrakesplugin.AirbrakeAerodynamicsTest" time="0.028"/>
+  <testcase name="Loads CSV and echoes grid-point values correctly" classname="com.airbrakesplugin.AirbrakeAerodynamicsTest" time="0.029"/>
   <testcase name="Constructor rejects null path" classname="com.airbrakesplugin.AirbrakeAerodynamicsTest" time="0.001"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>

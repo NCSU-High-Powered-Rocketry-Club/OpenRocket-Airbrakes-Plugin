@@ -5,6 +5,7 @@ import net.sf.openrocket.rocketcomponent.Rocket;
 import net.sf.openrocket.simulation.FlightDataType;
 import net.sf.openrocket.simulation.SimulationStatus;
 import net.sf.openrocket.simulation.listeners.SimulationListener;
+import net.sf.openrocket.util.Coordinate;
 import net.sf.openrocket.simulation.FlightData;
 import net.sf.openrocket.simulation.FlightDataBranch;
 import org.junit.jupiter.api.DisplayName;
@@ -146,4 +147,35 @@ class AirbrakeSimulationListenerTest {
         verify(forces, never()).setCD(anyDouble());
         verify(forces, never()).setCm(anyDouble());
     }
+    // @Test
+    // void dimensionalForceIsAdded() throws Exception {
+    //     AirbrakeSimulationListener sut =
+    //             new AirbrakeSimulationListener(minimalConfig(), rocket);
+
+    //     inject(sut, "currentDeployment", 1.0);
+    //     AirbrakeAerodynamics aero = mock(AirbrakeAerodynamics.class);
+    //     when(aero.getIncrementalCd(anyDouble(), anyDouble())).thenReturn(0.25); // big drag
+    //     when(aero.getIncrementalCm(anyDouble(), anyDouble())).thenReturn(0.0);
+    //     inject(sut, "aerodynamics", aero);
+
+    //     when(status.getFlightData()).thenReturn(flightData);
+    //     when(flightData.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(0.5);
+
+    //     Coordinate velocity = new Coordinate(0,0,150);    // 150 m/s straight up
+    //     when(status.getRocketVelocity()).thenReturn(velocity);
+    //     when(status.getRocketPosition()).thenReturn(new Coordinate(0,0,500));
+
+    //     Coordinate baseF = new Coordinate(0,0,-40);       // 40 N baseline drag
+    //     Coordinate baseM = new Coordinate();
+    //     AerodynamicForces base = new AerodynamicForces();
+    //     base.setCm(0.2);;
+    //     // No direct setMoment method available in AerodynamicForces
+    //     base.setCD(0.5);
+
+    //     AerodynamicForces out = sut.postAerodynamicCalculation(status, base);
+
+    //     // magnitude must increase:
+    //     assertTrue(out.getCN().length() > baseF.length() + 10.0);
+    // }
+
 }
