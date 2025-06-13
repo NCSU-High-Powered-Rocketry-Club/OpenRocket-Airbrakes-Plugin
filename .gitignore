@@ -88,3 +88,5 @@ nb-configuration.xml
 ## Miscellaneous
 ##############################
 *.log
+.gradle/
+build/
