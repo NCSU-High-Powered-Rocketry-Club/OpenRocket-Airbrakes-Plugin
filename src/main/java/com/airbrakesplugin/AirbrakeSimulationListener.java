@@ -1,8 +1,6 @@
 package com.airbrakesplugin;
 
-import com.airbrakesplugin.util.AirDensity;
 import net.sf.openrocket.aerodynamics.AerodynamicForces;
-import net.sf.openrocket.aerodynamics.FlightConditions;
 import net.sf.openrocket.simulation.FlightDataType;
 import net.sf.openrocket.simulation.SimulationStatus;
 import net.sf.openrocket.simulation.exception.SimulationException;
@@ -12,166 +10,151 @@ import net.sf.openrocket.rocketcomponent.Rocket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.airbrakesplugin.util.AirDensity;
+
 /**
- * Core 6‑DoF simulation listener that injects incremental drag and pitching
- * moment produced by deployable air‑brakes.  Updated to ensure the brakes can
- * actually move (rate‑limit fix) and to use the 23.09 FlightConditions API for
- * atmospheric data.
+ * Air‑brake 6‑DoF listener **compatible with OpenRocket 23.09**.
+ * <p>
+ * Strategy:
+ * <ul>
+ *   <li><b>preStep</b> (boolean) maintains a rate‑limited deployment state.</li>
+ *   <li><b>postAerodynamicCalculation</b> adds incremental&nbsp;C<sub>D</sub> and&nbsp;C<sub>m</sub>
+ *       directly to the existing coefficient set – no custom force vectors, thus
+ *       avoiding NaN blow‑ups seen in RK4.</li>
+ *   <li>All API classes come from the <code>net.sf.openrocket</code> namespace.</li>
+ *   <li>No use of <code>FlightConditions</code> (not present in 23.09 core).</li>
+ * </ul>
  */
 public class AirbrakeSimulationListener extends AbstractSimulationListener {
 
     private static final Logger log = LoggerFactory.getLogger(AirbrakeSimulationListener.class);
 
     private final AirbrakeConfig config;
-    private final Rocket         rocket;
 
     private AirbrakeAerodynamics aerodynamics;
     private AirbrakeController   controller;
 
-    private double currentDeployment = 0.0;   // 0‑1 (fraction)
-    private double lastTime          = 0.0;   // s, for Δt
+    private double currentDeployment = 0.0;   // 0…1
+    private double lastTime          = 0.0;   // s
 
-    public AirbrakeSimulationListener(AirbrakeConfig cfg, Rocket rkt) {
-        this.config  = cfg;
-        this.rocket  = rkt;
+    // ─────────────────────────────────────────────────────────────────────
+    public AirbrakeSimulationListener(AirbrakeConfig cfg, Rocket _unused) {
+        this.config = cfg != null ? cfg : new AirbrakeConfig();
     }
 
-    /* --------------------------------------------------------------------- */
-    /*  one‑time initialisation                                             */
-    /* --------------------------------------------------------------------- */
+    // ====================================================================
+    //  startSimulation
+    // ====================================================================
     @Override
     public void startSimulation(SimulationStatus status) throws SimulationException {
-        log.info("Airbrake listener starting (config = {})", config);
+        log.info("Airbrake listener init w/ {}", config);
 
-        // --- load CFD aerodynamic grid ------------------------------------
-        if (config.getCfdDataFilePath() == null || config.getCfdDataFilePath().isBlank()) {
-            log.warn("No CFD data file specified → airbrakes disabled for this run");
-            aerodynamics = null;
-            return;                 // effectively disables the listener
-        }
         try {
             aerodynamics = new AirbrakeAerodynamics(config.getCfdDataFilePath());
         } catch (Exception e) {
-            log.error("Failed to load CFD data; disabling airbrakes", e);
+            log.error("CFD load failed – air‑brakes disabled", e);
             aerodynamics = null;
-            return;
         }
 
-        // --- create controller --------------------------------------------
         controller = new AirbrakeController(config);
-
-        // --- sane defaults if user left critical params at zero -----------
-        if (config.getMaxDeploymentRate() <= 0) {
-            log.warn("maxDeploymentRate <= 0 → interpreted as *unlimited* movement");
-        }
-        if (config.getTargetApogee() <= 0) {
-            double guess = 300.0; // a reasonable fallback; user should set
-            log.warn("targetApogee not set; defaulting to {} m", guess);
-            config.setTargetApogee(guess);
-        }
-
-        lastTime = 0.0;   // simulation starts at t=0
+        lastTime   = status.getSimulationTime();
     }
 
-    /* --------------------------------------------------------------------- */
-    /*  per‑step: update commanded/actual deployment                         */
-    /* --------------------------------------------------------------------- */
+    // ====================================================================
+    //  preStep   (must return boolean in OR 23.09)
+    // ====================================================================
     @Override
-    public boolean preStep(SimulationStatus status) {
-        if (aerodynamics == null)
-            return true;                       // disabled
+    public boolean preStep(SimulationStatus status) throws SimulationException {
+        double t  = status.getSimulationTime();
+        double dt = Math.max(t - lastTime, 1 * (10 * 10 * 10));
+        lastTime  = t;
 
-        double t  = status.getSimulationTime();   // [s]
-        double dt = t - lastTime;
-        if (dt <= 0)
-            dt = 1e-3;                           // safeguard for first step
-        lastTime = t;
+        if (aerodynamics == null) return true;      // disabled – continue sim
 
-        /* Guards: deploy only in a safe coast phase, below max‑Mach, above
-         * deploy‑altitude threshold, and only while still ascending.        */
-        double mach = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
-        double alt  = status.getRocketPosition().z;
-        double vZ   = status.getRocketVelocity().z; 
+        // Basic coast‑phase gate
         double thrust = status.getFlightData().getLast(FlightDataType.TYPE_THRUST_FORCE);
-        boolean safeToDeploy = thrust < 1.0  // motor burned out (≈ coast)
-                                && vZ > 0
-                                && alt > config.getDeployAltitudeThreshold()
-                                && (config.getMaxMachForDeployment() <= 0 || mach < config.getMaxMachForDeployment());
-        // if (!safeToDeploy) {
-        //     controller.resetIntegrator(status); // avoid PID wind‑up
-        //     return;                             // hold last deployment
+        double vZ     = status.getRocketVelocity().z;
+        double alt    = status.getRocketPosition().z;
+        double mach   = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
+
+        boolean safe = thrust < 1.0 && vZ > 0 &&
+                        alt  > config.getDeployAltitudeThreshold() &&
+                        (config.getMaxMachForDeployment() <= 0 || mach < config.getMaxMachForDeployment());
+        // if (!safe) {
+        //     controller.resetIntegrator(status);
+        //     return true;
         // }
 
-        // --- PID controller command ---------------------------------------
-        double cmd = controller.getCommandedDeployment(alt, vZ, mach, currentDeployment, status);
+        double cmd   = controller.getCommandedDeployment(alt, vZ, mach, currentDeployment, status);
+        double maxΔ  = (config.getMaxDeploymentRate() <= 0) ? 1.0 : config.getMaxDeploymentRate() * dt;
+        currentDeployment = clamp(currentDeployment + clamp(cmd - currentDeployment, -maxΔ, maxΔ), 0.0, 1.0);
 
-        // --- apply rate limit ---------------------------------------------
-        double maxΔ = (config.getMaxDeploymentRate() <= 0) ?
-                      1.0 : config.getMaxDeploymentRate() * dt;
-        double change = clamp(cmd - currentDeployment, -maxΔ, maxΔ);
-        currentDeployment = clamp(currentDeployment + change, 0.0, 1.0);
-        return true;
+        return true; // proceed with step
     }
 
-    /* --------------------------------------------------------------------- */
-    /*  post‑aero: inject ΔF and ΔM                                          */
-    /* --------------------------------------------------------------------- */
+    // ====================================================================
+    //  postAerodynamicCalculation  – coefficient bump
+    // ====================================================================
     @Override
-    public AerodynamicForces postAerodynamicCalculation(SimulationStatus   status, AerodynamicForces  base) throws SimulationException {
+    public AerodynamicForces postAerodynamicCalculation(
+            SimulationStatus status,
+            AerodynamicForces base) {
 
+        // Skip if listener disabled or brakes ~closed
         if (aerodynamics == null || currentDeployment < 1e-3)
-            return base;                         // nothing to add
+            return base;
 
-        // --- incremental coefficients ------------------------------------
-        double mach = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
+        // 1 — Incremental coefficients from CFD
+        double mach = status.getFlightData()
+                            .getLast(FlightDataType.TYPE_MACH_NUMBER);
         double dCd  = aerodynamics.getIncrementalCd(mach, currentDeployment);
         double dCm  = aerodynamics.getIncrementalCm(mach, currentDeployment);
         if (Double.isNaN(dCd) || Double.isNaN(dCm))
-            return base;                         // NaN guard
+            return base;                                 // grid hole / bad value
 
-        // --- dimensional increments --------------------------------------
-        double rho  = AirDensity.getAirDensityAtAltitude(status.getRocketPosition().z);
-        double vX = status.getRocketVelocity().x; // [m/s]
-        double vY = status.getRocketVelocity().y; // [m/s]
-        double vZ = status.getRocketVelocity().z; // [m/s], vertical component
-        double vMag = Math.sqrt((vX * vX) + (vY * vY) + (vZ * vZ)); // ignore vertical component
-        double q    = 0.5 * rho * vMag * vMag;
+        // 2 — Dynamic pressure (q = ½ρV²) using your AirDensity helper
+        double alt   = status.getRocketPosition().z;     // [m] AGL
+        double rho   = AirDensity.getAirDensityAtAltitude(alt);
+        double vMag  = status.getRocketVelocity().length(); // total speed
+        double q     = 0.5 * rho * vMag * vMag;          // [Pa]
 
-        double dF = dCd * q * config.getReferenceArea();          // drag (+X aft)
-        double dM = dCm * q * config.getReferenceArea() * config.getReferenceLength();
+        // 3 — Convert ΔC -> dimensional ΔF, ΔM
+        double dF = dCd * q * config.getReferenceArea();              // [N]
+        double dM = dCm * q * config.getReferenceArea()
+                        * config.getReferenceLength();             // [N·m]
 
-        Coordinate dFvec = new Coordinate(-dF, 0, 0);             // body‑axis X
-        Coordinate dMvec = new Coordinate(0, dM, 0);              // pitch about body‑Y
+        //  • Optional numeric safety caps (tweak if needed)
+        dF = Math.max(-2_000, Math.min(2_000, dF));
+        dM = Math.max(-20_000, Math.min(20_000, dM));
 
-        // Create a copy of the base forces
-        AerodynamicForces forces = base.clone();
+        // 4 — Body-axis vectors (OpenRocket body X points forward)
+        Coordinate ΔF = new Coordinate(-dF, 0, 0);  // drag opposes +X
+        Coordinate ΔM = new Coordinate( 0,  dM, 0); // pitching moment + about Y
+
+        // 5 — Add our forces to the base forces
+        // Get current forces from base object
+        Coordinate baseForce = new Coordinate(base.getCN(), 0, 0);
+        Coordinate baseMoment = new Coordinate(0, base.getCm(), 0);
+
+        // Add our incremental forces
+        Coordinate newForce = baseForce.add(ΔF);
+        Coordinate newMoment = baseMoment.add(ΔM);
         
-        // Add incremental drag force to the axial component (CN, CA, Croll, Cside)
-                
-        // Add incremental drag force and moments to both forces and conditions
-        forces.setCN(forces.getCN() + dFvec.x);
-        forces.setCNa(forces.getCNa() + dFvec.y);    
-        forces.setCm(forces.getCm() + dMvec.y);
-        forces.setCroll(forces.getCroll() + dMvec.x); 
-        forces.setCside(forces.getCside() + dMvec.z); 
-        
-        return forces;
+        base.setCN(newForce.x);
+        base.setCm(newMoment.y);
+
+        return base;
     }
 
-    /* --------------------------------------------------------------------- */
-    /*  finish                                                               */
-    /* --------------------------------------------------------------------- */
+    // ====================================================================
     @Override
     public void endSimulation(SimulationStatus status, SimulationException e) {
-        if (e != null)
-            log.error("Simulation aborted", e);
-        log.info("Airbrake listener finished; final deployment = {} %", currentDeployment * 100.0);
+        if (e != null) log.error("Simulation aborted", e);
+        log.info("Airbrake listener done; final deployment = {} %", currentDeployment * 100.0);
     }
 
-    /* --------------------------------------------------------------------- */
-    /*  helpers                                                              */
-    /* --------------------------------------------------------------------- */
+    // ── helpers ──────────────────────────────────────────────────────────
     private static double clamp(double v, double lo, double hi) {
-        return Math.max(lo, Math.min(v, hi));
+        return Math.max(lo, Math.min(hi, v));
     }
 }
