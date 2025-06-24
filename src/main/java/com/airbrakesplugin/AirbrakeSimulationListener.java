@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.airbrakesplugin.util.AirDensity;
+import com.airbrakesplugin.util.CompressibleFlow;
 
 /**
  * Air‑brake 6‑DoF listener **compatible with OpenRocket 23.09**.
@@ -114,10 +115,16 @@ public class AirbrakeSimulationListener extends AbstractSimulationListener {
 
         // 2 — Dynamic pressure (q = ½ρV²) using your AirDensity helper
         double alt   = status.getRocketPosition().z;     // [m] AGL
-        double rho   = AirDensity.getAirDensityAtAltitude(alt);
         double vMag  = status.getRocketVelocity().length(); // total speed
-        double q     = 0.5 * rho * vMag * vMag;          // [Pa]
 
+        double rho  = AirDensity.getAirDensityAtAltitude(alt);
+        double q    = 0.5 * rho * vMag * vMag;             // incompressible
+
+        // Compressibility correction for transonic / supersonic flight
+        if (mach >= 0.3) {                                     // below 0.3 error <1 %
+            double pStatic = AirDensity.getStaticPressureAtAltitude(alt);
+            q = CompressibleFlow.compressibleDynamicPressure(pStatic, mach);
+        }
         // 3 — Convert ΔC -> dimensional ΔF, ΔM
         double dF = dCd * q * config.getReferenceArea();              // [N]
         double dM = dCm * q * config.getReferenceArea()

@@ -33,5 +33,22 @@ public final class AirDensity {
 
         return density;
     }
+    public static double getStaticPressureAtAltitude(double altitude) {
+        final double P0 = 101_325.0;      // sea-level pressure, Pa
+        final double T0 = 288.15;         // sea-level temperature, K
+        final double L  = 0.0065;         // lapse rate, K / m
+        final double g  = 9.80665;        // m / s²
+        final double R  = 287.05;         // J / kg · K
+
+        if (altitude < 11_000.0) {        // troposphere
+            double T = T0 - L * altitude;
+            return P0 * Math.pow(T / T0, g / (R * L));
+        } else {                          // 11-25 km isothermal layer
+            double p11 = 22_632.06;       // pressure at 11 km, Pa
+            double T11 = 216.65;          // temperature at 11 km, K
+            return p11 * Math.exp(-g * (altitude - 11_000.0) /
+                                (R * T11));
+        }
+    }
 }
 
