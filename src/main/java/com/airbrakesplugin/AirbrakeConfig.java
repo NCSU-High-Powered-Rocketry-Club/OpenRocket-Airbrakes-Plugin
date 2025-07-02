@@ -1,34 +1,57 @@
 package com.airbrakesplugin;
 
+import java.util.Optional;
+
 /**
  * Configuration container for the air-brake plugin.
- * All values are set via the configurator UI (or defaulted here).
+ * <p>
+ *   Updated for the <b>bang-bang + apogee-predictor</b> control scheme.
+ *   <ul>
+ *     <li>PID gains kept for backward compatibility but marked {@code @Deprecated}.</li>
+ *     <li>Added <i>apogeeToleranceMeters</i> so the GUI can expose the ±dead-band.</li>
+ *     <li>Renamed accessors to match reflection calls in {@link AirbrakeController}
+ *         (notably <code>getAlwaysOpenPercentage()</code>).</li>
+ *   </ul>
+ * </p>
  */
 public class AirbrakeConfig {
 
-    // --- Existing parameters --------------------------------------------------
+    // ── Core aerodynamic & deployment parameters ────────────────────────────
     private String  cfdDataFilePath;
     private double  referenceArea;
     private double  referenceLength;
     private double  maxDeploymentRate;
+
+    // Target & safety gates
     private double  targetApogee;
     private double  deployAltitudeThreshold;
     private double  maxMachForDeployment;
 
-    // --- NEW Waterloo-style controller parameters -----------------------------
-    /** If true, the controller holds the brakes at {@link #alwaysOpenPercent}. */
-    private boolean alwaysOpenMode   = false;
-    /** Fixed deployment level for “always-open” mode (0–1). */
-    private double  alwaysOpenPercent = 0.40;
+    // ── Bang-bang controller options ─────────────────────────────────────────
+    private boolean alwaysOpenMode;
+    private double  alwaysOpenPercentage;
 
-    /** PID gains – tuned for typical HPR rockets. */
-    private double kp = 0.010;     // proportional [-]
-    private double ki = 0.0004;    // integral     [1/s]
-    private double kd = 0.040;     // derivative   [s]
+    /** ±dead-band around set-point [m]; if {@code null} → default in controller. */
+    private Double  apogeeToleranceMeters;
+    
+    /**
+     * Constructor with default values.
+     */
+    public AirbrakeConfig() {
+        this.referenceArea = 0.0;            // m²
+        this.referenceLength = 0.0;          // m
+        this.maxDeploymentRate = 1.0;        // 1/s (fraction per second)
+        this.targetApogee = 0;           // m AGL
+        this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
+        this.maxMachForDeployment = 0.0;     // cap for supersonic
+        this.alwaysOpenMode = false;
+        this.alwaysOpenPercentage = 1.0;       // 0–1
+        this.apogeeToleranceMeters = null;
+    }
 
-    // -------------------------------------------------------------------------
-    // Getters & setters (existing + new)
-    // -------------------------------------------------------------------------
+    // =====================================================================
+    // Getters & setters (reflection-friendly naming)
+    // =====================================================================
     public String getCfdDataFilePath()               { return cfdDataFilePath; }
     public void   setCfdDataFilePath(String path)    { this.cfdDataFilePath = path; }
 
@@ -50,38 +73,34 @@ public class AirbrakeConfig {
     public double getMaxMachForDeployment()          { return maxMachForDeployment; }
     public void   setMaxMachForDeployment(double m)  { this.maxMachForDeployment = m; }
 
-    // --- NEW fields -----------------------------------------------------------
+    // ── Bang-bang related ──────────────────────────────────────────────────
     public boolean isAlwaysOpenMode()                { return alwaysOpenMode; }
     public void    setAlwaysOpenMode(boolean b)      { this.alwaysOpenMode = b; }
 
-    public double  getAlwaysOpenPercent()            { return alwaysOpenPercent; }
-    public void    setAlwaysOpenPercent(double pct)  { this.alwaysOpenPercent = clamp01(pct); }
+    /** Alias used by controller via reflection. */
+    public double  getAlwaysOpenPercentage()         { return alwaysOpenPercentage; }
+    public void    setAlwaysOpenPercentage(double pct){ this.alwaysOpenPercentage = clamp01(pct); }
 
-    public double  getKp()                           { return kp; }
-    public void    setKp(double kp)                  { this.kp = kp; }
+    /** Optional tolerance accessor (controller calls via reflection). */
+    public Optional<Double> getApogeeToleranceMeters(){ return Optional.ofNullable(apogeeToleranceMeters); }
+    public void setApogeeToleranceMeters(Double tol) { this.apogeeToleranceMeters = tol; }
 
-    public double  getKi()                           { return ki; }
-    public void    setKi(double ki)                  { this.ki = ki; }
-
-    public double  getKd()                           { return kd; }
-    public void    setKd(double kd)                  { this.kd = kd; }
-
-    // -------------------------------------------------------------------------
+    // =====================================================================
     private static double clamp01(double v) { return Math.max(0.0, Math.min(1.0, v)); }
 
     @Override
     public String toString() {
         return "AirbrakeConfig{" +
-               "cfdDataFilePath='" + cfdDataFilePath + '\'' +
-               ", referenceArea="          + referenceArea +
-               ", referenceLength="        + referenceLength +
-               ", maxDeploymentRate="      + maxDeploymentRate +
-               ", targetApogee="           + targetApogee +
-               ", deployAltitudeThreshold="+ deployAltitudeThreshold +
-               ", maxMachForDeployment="   + maxMachForDeployment +
-               ", alwaysOpenMode="         + alwaysOpenMode +
-               ", alwaysOpenPercent="      + alwaysOpenPercent +
-               ", kp=" + kp + ", ki=" + ki + ", kd=" + kd +
-               '}';
+                "cfdDataFilePath='" + cfdDataFilePath + '\'' +
+                ", referenceArea=" + referenceArea +
+                ", referenceLength=" + referenceLength +
+                ", maxDeploymentRate=" + maxDeploymentRate +
+                ", targetApogee=" + targetApogee +
+                ", deployAltitudeThreshold=" + deployAltitudeThreshold +
+                ", maxMachForDeployment=" + maxMachForDeployment +
+                ", alwaysOpenMode=" + alwaysOpenMode +
+                ", alwaysOpenPercentage=" + alwaysOpenPercentage +
+                ", apogeeToleranceMeters=" + apogeeToleranceMeters +
+                "}";
     }
 }

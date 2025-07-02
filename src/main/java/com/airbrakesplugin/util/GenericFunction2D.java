@@ -1,123 +1,141 @@
 package com.airbrakesplugin.util;
 
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVParser;
-import org.apache.commons.csv.CSVRecord;
+import org.apache.commons.csv.*;
 import org.apache.commons.math3.analysis.BivariateFunction;
 import org.apache.commons.math3.analysis.interpolation.BicubicInterpolator;
 
 import java.io.IOException;
-import java.io.Reader;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.TreeSet;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
 
-/**
- * Loads (mach, deployment) → value from a CSV and builds a bicubic interpolator.
- * Handles extrapolation per {@link ExtrapolationType}.
- */
-public class GenericFunction2D implements Function2D {
-    private final Path csvPath;
-    private final String valueColumn;
-    private final ExtrapolationType extrapolation;
-    private volatile BivariateFunction interp;
-    private double minX, maxX, minY, maxY;
+public final class GenericFunction2D {
 
-    public GenericFunction2D(Path csvPath, String valueColumn, ExtrapolationType extrapolation) {
-        this.csvPath       = csvPath;
-        this.valueColumn   = valueColumn;
-        this.extrapolation = extrapolation;
+    /* header aliases */
+    private static final List<String> MACH_HEADERS   = List.of("mach", "m");
+    private static final List<String> DEPLOY_HEADERS = List.of(
+            "deploymentpercentage", "deploymentpct", "deploymentlevel",
+            "deployment", "deploypct", "deployment_percentage");
+    private static final List<String> CD_HEADERS     = List.of("cdincrement", "cd", "dcd");
+    private static final List<String> CM_HEADERS     = List.of("cmincrement", "cm", "dcm");
+
+    /* ------------------------------------------------------------------ */
+    private final Path csvFile;
+    private volatile BivariateFunction cdFunc;
+    private volatile BivariateFunction cmFunc;
+    private double[] machAxis, deployAxis;
+
+    public GenericFunction2D(Path csvFile) { this.csvFile = Objects.requireNonNull(csvFile); }
+
+    /* public look-ups --------------------------------------------------- */
+    public double valueCd(double mach, double deploy) {
+        ensureBuilt();
+        return cdFunc.value(clamp(mach, machAxis), clamp(deploy, deployAxis));
+    }
+    public double valueCm(double mach, double deploy) {
+        ensureBuilt();
+        return cmFunc.value(clamp(mach, machAxis), clamp(deploy, deployAxis));
     }
 
-    @Override
-    public double value(double x, double y) {
-        ensureInterpolatorBuilt();
+    /* ------------------------------------------------------------------ */
+    private synchronized void ensureBuilt() {
+        if (cdFunc != null) return;
+        if (!Files.isReadable(csvFile))
+            throw new IllegalStateException("CFD CSV unreadable: " + csvFile);
 
-        boolean outX = x < minX || x > maxX;
-        boolean outY = y < minY || y > maxY;
-        if (outX || outY) {
-            switch (extrapolation) {
-                case ZERO:
-                    return 0.0;
-                case CONSTANT:
-                    x = clamp(x, minX, maxX);
-                    y = clamp(y, minY, maxY);
-                    break;
-                case NATURAL:
-                    // trust the interpolator to extrapolate
-                    break;
+        CSVFormat fmt = CSVFormat.Builder.create()
+                .setHeader().setSkipHeaderRecord(true).setTrim(true).build();
+
+        /* Map<Mach, Map<Deploy, [dCd,dCm]>> */
+        Map<Double, Map<Double, double[]>> tbl = new TreeMap<>();
+
+        try (CSVParser p = CSVParser.parse(csvFile, StandardCharsets.UTF_8, fmt)) {
+            Map<String,Integer> hdr = normaliseHeaders(p.getHeaderMap());
+
+            String kMach   = pick(hdr, MACH_HEADERS,   "Mach");
+            String kDep    = pick(hdr, DEPLOY_HEADERS, "deployment-percentage");
+            String kCd     = pick(hdr, CD_HEADERS,     "ΔCd");
+            String kCm     = pick(hdr, CM_HEADERS,     "ΔCm");
+
+            for (CSVRecord r : p) {
+                double m  = Double.parseDouble(r.get(hdr.get(kMach)));
+                double d  = Double.parseDouble(r.get(hdr.get(kDep)));
+                double dCd= Double.parseDouble(r.get(hdr.get(kCd)));
+                double dCm= Double.parseDouble(r.get(hdr.get(kCm)));
+
+                tbl.computeIfAbsent(m, k -> new TreeMap<>())
+                   .put(d, new double[]{dCd, dCm});
+            }
+        } catch (IOException ioe) {
+            throw new IllegalStateException("Error reading CFD CSV: " + csvFile, ioe);
+        }
+
+        /* ---------- axes (ensure 0-% row exists) ------------------------ */
+        machAxis   = tbl.keySet().stream().mapToDouble(Double::doubleValue).toArray();
+
+        Set<Double> deploySet = new TreeSet<>();
+        tbl.values().forEach(m -> deploySet.addAll(m.keySet()));
+        deploySet.add(0.0);                                  // force 0-row
+        deployAxis = deploySet.stream().mapToDouble(Double::doubleValue).toArray();
+
+        int nx = machAxis.length, ny = deployAxis.length;
+        double[][] zCd = new double[nx][ny];
+        double[][] zCm = new double[nx][ny];
+
+        for (int i = 0; i < nx; i++) {
+            Map<Double,double[]> row = tbl.get(machAxis[i]);
+            for (int j = 0; j < ny; j++) {
+                double dep = deployAxis[j];
+                double[] v = row.get(dep);
+
+                if (v == null) {
+                    /* special-case: missing 0-% gets [0,0]; others → nearest */
+                    v = (dep == 0.0)
+                            ? new double[]{0.0, 0.0}
+                            : nearest(tbl, machAxis[i], dep);
+                }
+                zCd[i][j] = v[0];
+                zCm[i][j] = v[1];
             }
         }
-        return interp.value(x, y);
+
+        BicubicInterpolator interp = new BicubicInterpolator();
+        cdFunc = interp.interpolate(machAxis, deployAxis, zCd);
+        cmFunc = interp.interpolate(machAxis, deployAxis, zCm);
     }
 
-    private synchronized void ensureInterpolatorBuilt() {
-        if (interp != null) return;
-
-        List<Double> xList = new ArrayList<>();
-        List<Double> yList = new ArrayList<>();
-        List<Record> records = new ArrayList<>();
-
-        try (Reader reader = Files.newBufferedReader(csvPath);
-             CSVParser parser = CSVFormat.DEFAULT
-                                 .builder()
-                                 .setHeader()
-                                 .setSkipHeaderRecord(true)
-                                 .build()
-                                 .parse(reader)) {
-            for (CSVRecord rec : parser) {
-                double mach   = Double.parseDouble(rec.get("Mach"));
-                double deploy = Double.parseDouble(rec.get("DeploymentPercentage"));
-                double val    = Double.parseDouble(rec.get(valueColumn));
-                xList.add(mach);
-                yList.add(deploy);
-                records.add(new Record(mach, deploy, val));
+    /* nearest-neighbour fallback */
+    private static double[] nearest(Map<Double, Map<Double, double[]>> tbl,
+                                    double mach, double dep) {
+        double best = Double.MAX_VALUE;
+        double[] val = null;
+        for (var e1 : tbl.entrySet()) {
+            double dm = e1.getKey() - mach;
+            for (var e2 : e1.getValue().entrySet()) {
+                double dd = e2.getKey() - dep;
+                double dist = dm*dm + dd*dd;
+                if (dist < best) { best = dist; val = e2.getValue(); }
             }
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to read CSV at " + csvPath, e);
         }
-
-        // unique sorted axes
-        Set<Double> xSet = new TreeSet<>(xList);
-        Set<Double> ySet = new TreeSet<>(yList);
-        double[] xs = xSet.stream().mapToDouble(Double::doubleValue).toArray();
-        double[] ys = ySet.stream().mapToDouble(Double::doubleValue).toArray();
-
-        minX = xs[0];           maxX = xs[xs.length-1];
-        minY = ys[0];           maxY = ys[ys.length-1];
-
-        // fill grid f[i][j] = f(xs[i], ys[j])
-        double[][] f = new double[xs.length][ys.length];
-        for (Record r : records) {
-            int i = idx(xs, r.x);
-            int j = idx(ys, r.y);
-            f[i][j] = r.value;
-        }
-
-        // build interpolator
-        interp = new BicubicInterpolator().interpolate(xs, ys, f);
+        return val;
     }
 
-    private int idx(double[] arr, double v) {
-        for (int i = 0; i < arr.length; i++) {
-            if (arr[i] == v) return i;
-        }
-        throw new IllegalArgumentException("Value "+v+" not in axis");
+    /* helpers */
+    private static Map<String,Integer> normaliseHeaders(Map<String,Integer> raw) {
+        Map<String,Integer> n = new HashMap<>();
+        raw.forEach((k,v) -> n.put(
+                k.toLowerCase(Locale.ROOT)
+                 .replace("%","").replace("_","")
+                 .replace("-","").replace(" ",""),
+                v));
+        return n;
     }
-
-    private double clamp(double v, double lo, double hi) {
-        return Math.max(lo, Math.min(hi, v));
+    private static String pick(Map<String,Integer> hdr, List<String> alias, String name) {
+        return alias.stream().filter(hdr::containsKey).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "CSV missing " + name + " column (found " + hdr.keySet() + ')'));
     }
-
-    private static class Record {
-        final double x, y, value;
-        Record(double x, double y, double value) {
-            this.x     = x;
-            this.y     = y;
-            this.value = value;
-        }
+    private static double clamp(double v, double[] axis) {
+        return Math.max(axis[0], Math.min(v, axis[axis.length-1]));
     }
 }
