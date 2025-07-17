@@ -69,14 +69,6 @@ public class AirbrakeConfigurator
         panel.add(lengthSpinner);
         panel.add(new UnitSelector(lengthModel), "wrap");
 
-        // --- Max deployment rate spinner ---
-        panel.add(new JLabel("Max deployment rate (Hz):"));
-        DoubleModel rateModel = new DoubleModel(
-            ext, "MaxDeploymentRate", UnitGroup.UNITS_NONE, ext.getMaxDeploymentRate()
-        );
-        JSpinner rateSpinner = new JSpinner(rateModel.getSpinnerModel());
-        rateSpinner.setEditor(new SpinnerEditor(rateSpinner));
-        panel.add(rateSpinner, "wrap");
 
         // --- Target apogee spinner ---
         panel.add(new JLabel("Target apogee:"));

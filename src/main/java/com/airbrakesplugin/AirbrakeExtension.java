@@ -48,13 +48,6 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
         config.setReferenceLength(l); fireChangeEvent(); 
     } 
 
-   public double getMaxDeploymentRate() {
-        return config.getMaxDeploymentRate(); 
-    }
-    public void   setMaxDeploymentRate(double r) {
-        config.setMaxDeploymentRate(r); fireChangeEvent(); 
-    } 
-
    public double getTargetApogee() {
         return config.getTargetApogee(); 
     }

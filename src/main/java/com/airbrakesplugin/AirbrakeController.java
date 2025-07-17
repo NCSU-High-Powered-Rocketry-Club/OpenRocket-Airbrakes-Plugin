@@ -227,6 +227,8 @@ public class AirbrakeController {
         private List<Double> lutVel = Collections.emptyList();
         private List<Double> lutDeltaH = Collections.emptyList();
 
+        private Double initialVelocity = null;
+
         void reset() {
             accels.clear();
             dts.clear();
@@ -238,6 +240,12 @@ public class AirbrakeController {
         void update(double accel, double dt, double altitude, double velocity) {
             this.currentAlt = altitude;
             this.currentVel = velocity;
+
+            // Store initial velocity when we first start collecting data
+            if (initialVelocity == null) {
+                initialVelocity = velocity;
+            }
+
             accels.add(accel);
             dts.add(dt);
             if (!hasConverged && accels.size() >= MIN_PACKETS) {
@@ -294,21 +302,41 @@ public class AirbrakeController {
         private void buildLookupTable() {
             List<Double> vOut = new ArrayList<>();
             List<Double> hOut = new ArrayList<>();
+            List<Double> altitudes = new ArrayList<>();
+            
             double v = currentVel;
             double h = 0.0;
             double time = 0.0;
             double dt = 0.02;
+            
+            // First, simulate the trajectory to find apogee
             while (v > 0 && time < 40.0) {
                 double a = CURVE.value(time, coeffs) - gravity(currentAlt);
                 v += a * dt;
                 if (v < 0) break;
                 h += v * dt;
                 vOut.add(v);
-                hOut.add(h);
+                altitudes.add(h);
                 time += dt;
             }
+            
+            // Find the maximum altitude (apogee)
+            double apogee = 0.0;
+            for (double altitude : altitudes) {
+                if (altitude > apogee) {
+                    apogee = altitude;
+                }
+            }
+            
+            // Calculate delta height to apogee for each point
+            for (double altitude : altitudes) {
+                hOut.add(apogee - altitude);
+            }
+            
+            // Reverse the lists to match the Python implementation's order
             Collections.reverse(vOut);
             Collections.reverse(hOut);
+            
             this.lutVel = vOut;
             this.lutDeltaH = hOut;
         }
