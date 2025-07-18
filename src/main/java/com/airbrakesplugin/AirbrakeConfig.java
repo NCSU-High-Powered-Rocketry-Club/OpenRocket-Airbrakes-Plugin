@@ -40,7 +40,7 @@ public class AirbrakeConfig {
     public AirbrakeConfig() {
         this.referenceArea = 0.0;            // m²
         this.referenceLength = 0.0;          // m
-        this.maxDeploymentRate = 5.0;        // 1/s (fraction per second)
+        this.maxDeploymentRate = 1.0;        // 1/s (fraction per second)
         this.targetApogee = 0;           // m AGL
         this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
         this.maxMachForDeployment = 0.0;     // cap for supersonic
@@ -94,6 +94,7 @@ public class AirbrakeConfig {
                 "cfdDataFilePath='" + cfdDataFilePath + '\'' +
                 ", referenceArea=" + referenceArea +
                 ", referenceLength=" + referenceLength +
+                ", maxDeploymentRate=" + maxDeploymentRate +
                 ", targetApogee=" + targetApogee +
                 ", deployAltitudeThreshold=" + deployAltitudeThreshold +
                 ", maxMachForDeployment=" + maxMachForDeployment +
