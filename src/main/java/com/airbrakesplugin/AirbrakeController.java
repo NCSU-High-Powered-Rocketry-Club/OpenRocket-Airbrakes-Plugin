@@ -34,12 +34,15 @@ public class AirbrakeController {
     private static final double G0 = 9.80665;          // standard gravity @ sea level [m/s²]
     private static final double EARTH_RADIUS = 6_371_000.0; // mean Earth radius   [m]
 
-    private static final double DEFAULT_TOLERANCE = 5.0;    // ±m around set‑point
+    private static final double DEFAULT_TOLERANCE = 10;    // ±m around set‑point
     private static final int    MIN_PACKETS = 12;           // data points before fitting
     private static final double MAX_RMSE_FOR_CONVERGENCE = 0.6; // m/s²
 
     private final AirbrakeConfig config;
     private final ApogeePredictor predictor;
+    private Double lastVelocity = null;
+
+    private boolean debugEnabled = true;
 
     public AirbrakeController(final AirbrakeConfig config) {
         this.config = config;
@@ -50,13 +53,21 @@ public class AirbrakeController {
      * Primary API used by {@link com.airbrakesplugin.AirbrakeSimulationListener}.
      */
     public double getCommandedDeployment(
-            final double altitude,          // m AGL (assumed small compared to R⊕)
-            final double vVertical,          // m/s  (+ up)
-            final double aVertical,          // m/s² (+ up)
-            final double dt,                 // s    (time‑step)
-            final double mach,               // ‑‑    (no unit)
-            final double currentDeployment,  // 0–1   (actuator state)
+            final double alt,               // m AGL (altitude above ground level)
+            final double vz,                // m/s  (vertical velocity, + up)
+            final double mach,              // ‑‑    (no unit)
+            final double currentDeployment, // 0–1   (actuator state)
             final SimulationStatus status) {
+        // Calculate acceleration and time step from state
+        double aVertical = 0.0;
+        double dt = 0.01; // Default simulation time step
+
+        if (lastVelocity != null) {
+            aVertical = (vz - lastVelocity) / dt;
+        }
+        
+        // Store current velocity for next call
+        lastVelocity = vz;
 
         // -------------------------------------------------------------
         // Always‑open mode (test bench / ground diagnostics)
@@ -69,8 +80,8 @@ public class AirbrakeController {
         // Safety interlocks
         // -------------------------------------------------------------
         if (isMotorBurning(status)                  // motor ignited → avoid braking
-                || vVertical < 0                    // descending
-                || altitude < getDeployAltitudeThreshold()
+                || vz < 0                           // descending
+                || alt < getDeployAltitudeThreshold()
                 || mach > getMaxMachForDeployment()) {
             predictor.reset(); // flush predictor so it refits after power‑phase
             return 0.0;
@@ -79,14 +90,21 @@ public class AirbrakeController {
         // -------------------------------------------------------------
         // Update predictor & retrieve apogee estimate
         // -------------------------------------------------------------
-        predictor.update(aVertical, dt, altitude, vVertical);
+        predictor.update(aVertical, dt, alt, vz);
         final double predictedApogee = predictor.getPredictedApogee();
+        final double tolerance = getApogeeToleranceMeters();
+        final double error = predictedApogee - getTargetApogee();
+        
+        // Debug logging per time step
+        if (debugEnabled) {
+            System.out.printf("Time step: %.3fs | Alt: %.2fm | Velocity: %.2fm/s | Predicted apogee: %.2fm | Target error: %.2fm | Deployment: %.2f%n", 
+                dt, alt, vz, predictedApogee, predictedApogee - getTargetApogee(), 
+                (error > tolerance) ? 1.0 : ((error < -tolerance) ? 0.0 : currentDeployment));
+        }
 
         // -------------------------------------------------------------
         // Bang‑bang around target
         // -------------------------------------------------------------
-        final double tolerance = getApogeeToleranceMeters();
-        final double error = predictedApogee - getTargetApogee();
 
         if (error > tolerance) {
             return 1.0;   // overshoot → deploy brakes fully

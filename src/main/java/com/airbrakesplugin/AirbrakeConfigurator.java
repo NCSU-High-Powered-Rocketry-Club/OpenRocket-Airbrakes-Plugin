@@ -83,6 +83,7 @@ public class AirbrakeConfigurator
         DoubleModel apogeeModel = new DoubleModel(
             ext, "TargetApogee", UnitGroup.UNITS_LENGTH, ext.getTargetApogee()
         );
+
         JSpinner apogeeSpinner = new JSpinner(apogeeModel.getSpinnerModel());
         apogeeSpinner.setEditor(new SpinnerEditor(apogeeSpinner));
         panel.add(apogeeSpinner);
@@ -103,6 +104,7 @@ public class AirbrakeConfigurator
         DoubleModel maxMachModel = new DoubleModel(
             ext, "MaxMachForDeployment", UnitGroup.UNITS_NONE, ext.getMaxMachForDeployment()
         );
+
         JSpinner maxMachSpinner = new JSpinner(maxMachModel.getSpinnerModel());
         maxMachSpinner.setEditor(new SpinnerEditor(maxMachSpinner));
         panel.add(maxMachSpinner, "wrap");
