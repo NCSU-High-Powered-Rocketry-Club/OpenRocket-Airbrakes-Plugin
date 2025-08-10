@@ -1,14 +1,12 @@
 plugins {
     id 'java'
-    // For creating a "fat JAR" that includes dependencies:
-    id 'com.github.johnrengelman.shadow' version '7.1.2' // Check for the latest version
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
 }
 
 // Diagnostic check for OpenRocket JAR
-// This code runs during Gradle's configuration phase.
-// It checks if the JAR file is found at the expected path relative to the project root.
-def openRocketJarPath = 'libs/OpenRocket-23.09.jar'
-def openRocketJarFileForCheck = file(openRocketJarPath) // 'file()' resolves against project directory. Renamed variable for clarity.
+def openRocketJarName = 'OpenRocket-23.09.jar' // Using the version from your compileOnly dependency
+def openRocketJarPath = "libs/${openRocketJarName}"
+def openRocketJarFileForCheck = file(openRocketJarPath)
 
 if (!openRocketJarFileForCheck.exists()) {
     println "------------------------------------------------------------------------------------"
@@ -16,12 +14,10 @@ if (!openRocketJarFileForCheck.exists()) {
     println "Expected path: ${openRocketJarFileForCheck.absolutePath}"
     println "Please ensure:"
     println "1. The 'libs' folder exists directly under your project root: ${project.projectDir}/libs"
-    println "2. The JAR file is named EXACTLY 'OpenRocket-24.12.RC.01.jar' (case-sensitive)."
+    println "2. The JAR file is named EXACTLY '${openRocketJarName}' (case-sensitive)."
     println "3. The JAR file is placed inside the 'libs' folder."
     println "Build is likely to fail due to missing OpenRocket classes."
     println "------------------------------------------------------------------------------------"
-    // You could even make the build fail early here if desired:
-    // throw new GradleException("OpenRocket JAR not found at ${openRocketJarFileForCheck.absolutePath}. Halting build.")
 } else {
     println "------------------------------------------------------------------------------------"
     println "SUCCESS (Gradle Build): OpenRocket JAR file FOUND by Gradle at (checked path):"
@@ -29,92 +25,40 @@ if (!openRocketJarFileForCheck.exists()) {
     println "------------------------------------------------------------------------------------"
 }
 
-
-group = 'com.airbrakesplugin' // Changed to match new package
+group = 'com.airbrakesplugin'
 version = '1.0-SNAPSHOT'
 
 repositories {
     mavenCentral()
-    // Tell Gradle to look in the 'libs' directory for JAR files.
-    // This 'libs' folder must be in the SAME directory as this build.gradle file.
-    // e.g., C:\SchoolStuff\7th - 8th Senior Design\Airbrakes Plugin\Attempt #3\libs\
     flatDir {
         dirs 'libs'
     }
 }
 
 dependencies {
-    // --- OpenRocket Core Dependency ---
-    // Make it testImplementation also to ensure it's available for tests
-    implementation files('libs/OpenRocket-23.09.jar')
-    testImplementation files('libs/OpenRocket-23.09.jar')
-    
-    // --- Apache Commons Math for Interpolation ---
+    // Using the variable defined in the diagnostic check for consistency
+    compileOnly files(openRocketJarPath)
+
     implementation 'org.apache.commons:commons-math3:3.6.1'
-
-    // --- Apache Commons CSV for CSV Parsing ---
-    implementation 'org.apache.commons:commons-csv:1.10.0' // Check for latest version
-
-    // --- SLF4J for logging (optional but good practice) ---
+    implementation 'org.apache.commons:commons-csv:1.10.0'
     implementation 'org.slf4j:slf4j-api:2.0.7'
-    // Add a logging implementation, e.g., Logback or SLF4J Simple
     runtimeOnly 'org.slf4j:slf4j-simple:2.0.7'
 
-
-    // --- JUnit for testing (recommended) ---
-    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
-    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
-    testImplementation 'org.mockito:mockito-junit-jupiter:5.3.1'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
 }
 
 java {
-    // Update Java version to a more recent one
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
 }
 
-// If using the Shadow plugin to create a fat JAR:
 shadowJar {
     archiveBaseName.set('AirbrakePlugin')
-    archiveClassifier.set('') // To avoid '-all' suffix if not desired
+    archiveClassifier.set('')
     archiveVersion.set(project.version.toString())
-    // You might need to configure merging strategies for manifest files if conflicts arise
 }
 
-// Task to run tests
 test {
-    useJUnitPlatform() // Use JUnit 5 platform
-
-    // Add JVM argument to enable experimental ByteBuddy support for Java 24
-    jvmArgs = ['-Dnet.bytebuddy.experimental=true']
-    
-    // Verbose test logging
-    testLogging {
-        events "passed", "skipped", "failed", "standardOut", "standardError"
-        showExceptions true
-        showCauses true
-        showStackTraces true
-        exceptionFormat "full"
-        showStandardStreams true // Show test output
-        
-        // Log test results at the given level
-        info {
-            events = ["failed", "skipped", "passed", "standardOut", "standardError"]
-            showStandardStreams = true
-        }
-    }
-    
-    // Always run tests
-    outputs.upToDateWhen { false }
-    
-    // Print test summary
-    afterSuite { desc, result ->
-        if (desc.parent) return // Only display summary for whole test run
-        def output = "Results: ${result.resultType} " +
-                     "(${result.testCount} tests, " +
-                     "${result.successfulTestCount} passed, " +
-                     "${result.failedTestCount} failed, " +
-                     "${result.skippedTestCount} skipped)"
-        println output
-    }
+    useJUnitPlatform()
 }

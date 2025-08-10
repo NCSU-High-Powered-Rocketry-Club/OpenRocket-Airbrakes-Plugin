@@ -1,5 +1,6 @@
 package com.airbrakesplugin;
 
+import net.sf.openrocket.rocketcomponent.Rocket;
 import net.sf.openrocket.simulation.SimulationConditions;
 import net.sf.openrocket.simulation.exception.SimulationException;
 import net.sf.openrocket.simulation.extension.AbstractSimulationExtension;
@@ -18,9 +19,38 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
 
     // =====================================================================
     @Override
+    public String getName() {
+        return "6DOF Airbrake Simulation";
+    }
+
+    @Override
+    public String getDescription() {
+        return "Adds 6DOF-aware airbrake simulation capabilities using CFD data.";
+    }
+
+    // =====================================================================
+    @Override
     public void initialize(SimulationConditions conditions) throws SimulationException {
         log.info("Initializing AirbrakeExtension with config: {}", config);
-        conditions.getSimulationListenerList() .add((SimulationListener) new AirbrakeSimulationListener(config, conditions.getRocket()));
+        
+        // Basic validation
+        if (config.getCfdDataFilePath() == null || config.getCfdDataFilePath().trim().isEmpty()) {
+            throw new SimulationException("CFD data file path is not configured for AirbrakeExtension.");
+        }
+        
+        conditions.getSimulationListenerList().add((SimulationListener) new AirbrakeSimulationListener(config, conditions.getRocket()));
+    }
+
+    // =====================================================================
+    public SimulationListener getSimulationListener(SimulationConditions conditions) {
+        log.info("AirbrakeExtension: Creating simulation listener");
+        
+        Rocket rocket = (conditions != null) ? conditions.getRocket() : null;
+        if (rocket == null) {
+            log.warn("AirbrakeExtension: Rocket is null. Listener will be created with null rocket.");
+        }
+        
+        return new AirbrakeSimulationListener(config, rocket);
     }
 
     // =====================================================================
@@ -30,53 +60,53 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     public String getCfdDataFilePath() { 
         return config.getCfdDataFilePath(); 
     }
-    public void   setCfdDataFilePath(String p) {
+    public void setCfdDataFilePath(String p) {
         config.setCfdDataFilePath(p); fireChangeEvent(); 
     } 
 
-   public double getReferenceArea() {
+    public double getReferenceArea() {
         return config.getReferenceArea(); 
     }
-    public void   setReferenceArea(double a) {
+    public void setReferenceArea(double a) {
         config.setReferenceArea(a); fireChangeEvent(); 
     } 
 
-   public double getReferenceLength() {
+    public double getReferenceLength() {
         return config.getReferenceLength(); 
     }
-    public void   setReferenceLength(double l) {
+    public void setReferenceLength(double l) {
         config.setReferenceLength(l); fireChangeEvent(); 
     } 
 
-   public double getMaxDeploymentRate() {
+    public double getMaxDeploymentRate() {
         return config.getMaxDeploymentRate(); 
     }
-    public void   setMaxDeploymentRate(double r) {
+    public void setMaxDeploymentRate(double r) {
         config.setMaxDeploymentRate(r); fireChangeEvent(); 
     } 
 
-   public double getTargetApogee() {
+    public double getTargetApogee() {
         return config.getTargetApogee(); 
     }
-    public void   setTargetApogee(double a) {
+    public void setTargetApogee(double a) {
         config.setTargetApogee(a); fireChangeEvent(); 
     } 
 
-   public double getDeployAltitudeThreshold() {
+    public double getDeployAltitudeThreshold() {
         return config.getDeployAltitudeThreshold(); 
     }
-    public void   setDeployAltitudeThreshold(double h) {
+    public void setDeployAltitudeThreshold(double h) {
         config.setDeployAltitudeThreshold(h); fireChangeEvent(); 
     } 
 
-   public double getMaxMachForDeployment() {
+    public double getMaxMachForDeployment() {
         return config.getMaxMachForDeployment(); 
     }
-    public void   setMaxMachForDeployment(double m) {
+    public void setMaxMachForDeployment(double m) {
         config.setMaxMachForDeployment(m); fireChangeEvent(); 
     } 
 
-   // ── Bang‑bang controller extras  ────────────────
+    // ── Bang‑bang controller extras  ────────────────
     public boolean isAlwaysOpenMode() {
         return config.isAlwaysOpenMode(); 
     }
@@ -84,14 +114,14 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
         config.setAlwaysOpenMode(b); fireChangeEvent(); 
     } 
 
-   public double getAlwaysOpenPercentage() {
+    public double getAlwaysOpenPercentage() {
         return config.getAlwaysOpenPercentage(); 
     }
     public void setAlwaysOpenPercentage(double p) {
         config.setAlwaysOpenPercentage(p); fireChangeEvent(); 
     } 
 
-   public double getApogeeToleranceMeters() {
+    public double getApogeeToleranceMeters() {
         return config.getApogeeToleranceMeters().orElse(null); 
     }
     public void setApogeeToleranceMeters(Double tol) {
@@ -99,6 +129,7 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     }
 
     @Override
-    public String toString() { return config.toString(); 
+    public String toString() { 
+        return config.toString(); 
     }
 }

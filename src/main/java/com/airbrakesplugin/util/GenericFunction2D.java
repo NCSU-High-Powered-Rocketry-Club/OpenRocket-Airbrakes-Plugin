@@ -109,9 +109,9 @@ public final class GenericFunction2D {
                                     double mach, double dep) {
         double best = Double.MAX_VALUE;
         double[] val = null;
-        for (var e1 : tbl.entrySet()) {
+        for (Map.Entry<Double, Map<Double, double[]>> e1 : tbl.entrySet()) {
             double dm = e1.getKey() - mach;
-            for (var e2 : e1.getValue().entrySet()) {
+            for (Map.Entry<Double, double[]> e2 : e1.getValue().entrySet()) {
                 double dd = e2.getKey() - dep;
                 double dist = dm*dm + dd*dd;
                 if (dist < best) { best = dist; val = e2.getValue(); }
