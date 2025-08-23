@@ -1,16 +1,15 @@
 package com.airbrakesplugin;
 
-import com.airbrakesplugin.util.AirDensity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.sf.openrocket.aerodynamics.AerodynamicForces;
-import net.sf.openrocket.rocketcomponent.Rocket;
-import net.sf.openrocket.simulation.FlightDataType;
-import net.sf.openrocket.simulation.SimulationStatus;
-import net.sf.openrocket.simulation.exception.SimulationException;
-import net.sf.openrocket.simulation.listeners.AbstractSimulationListener;
-import net.sf.openrocket.util.Coordinate;
+import info.openrocket.core.aerodynamics.AerodynamicForces;
+import info.openrocket.core.rocketcomponent.Rocket;
+import info.openrocket.core.simulation.FlightDataType;
+import info.openrocket.core.simulation.SimulationStatus;
+import info.openrocket.core.simulation.exception.SimulationException;
+import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
+import info.openrocket.core.util.Coordinate;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -55,6 +54,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     // ── state ──────────────────────────────────────────────────────────────
     private double lastTime_s = 0.0;
     private double deploy     = 0.0;   // current physical deployment ∈ [0..1]
+    
+    // ── constants ─────────────────────────────────────────────────────────
+    private static final double DEFAULT_MAX_RATE_FRAC_PER_S = 1.0; // fallback if config is 0/NaN
 
     // ── ctor ───────────────────────────────────────────────────────────────
     public AirbrakeSimulationListener(final AirbrakeConfig cfg, final Rocket rkt) {
@@ -66,13 +68,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     @Override
     public void startSimulation(final SimulationStatus status) throws SimulationException {
         // 0) geometry & limits
-        this.Sref = (config.getReferenceArea()   > 0.0) ? config.getReferenceArea()   : inferSrefFromRocket(rocket);
-        this.Lref = (config.getReferenceLength() > 0.0) ? config.getReferenceLength() : inferLrefFromRocket(rocket);
-
-        // Allow config in %/s or fraction/s (defensive): if >1, treat as %/s
-        double rateConfigured = Math.max(0.0, config.getMaxDeploymentRate());
-        this.maxRate = (rateConfigured > 1.0) ? rateConfigured / 100.0 : rateConfigured;
-
+        this.maxRate = DEFAULT_MAX_RATE_FRAC_PER_S;
         // 1) subsystems
         try {
             this.aerodynamics = new AirbrakeAerodynamics(config.getCfdDataFilePath());
@@ -81,6 +77,21 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             throw new SimulationException("Airbrake CFD data failed to load", e);
         }
         this.controller = new AirbrakeController(config);
+
+        // Wire context callbacks (optional but makes your external "tell it to extend" hooks real)
+        this.controller.setContext(new AirbrakeController.ControlContext() {
+            @Override public void extend_airbrakes() {
+                // no-op here; the actuator follows getCommandedDeployment's return value
+                // (you could set a flag to bias the command if you want)
+            }
+            @Override public void retract_airbrakes() {
+                // same note as above
+            }
+            @Override public void switch_altitude_back_to_pressure() {
+                // If you have a pressure-altitude source that needs switching, do it here via reflection
+                // or by calling your own hook.
+            }
+        });
 
         // 2) state init
         this.deploy     = 0.0;
@@ -108,19 +119,23 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         double mach = 0.0;
         try {
-            mach = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
+            mach = status.getFlightDataBranch().getLast(FlightDataType.TYPE_MACH_NUMBER);
         } catch (Throwable ignore) { /* leave 0.0 */ }
 
         double az = Double.NaN; // prefer OR-provided accel; controller will dv/dt fallback if NaN
         try {
-            final Coordinate acc = status.getRocketAcceleration();
+            final double acc_xy = status.getFlightDataBranch().getLast(FlightDataType.TYPE_ACCELERATION_XY);
+            final double acc_z  = status.getFlightDataBranch().getLast(FlightDataType.TYPE_ACCELERATION_Z);
+
+            final Coordinate acc = new Coordinate(acc_xy, 0.0, acc_z);
+
             if (acc != null && Double.isFinite(acc.z)) az = acc.z;
         } catch (Throwable ignore) { /* ok */ }
 
         // (optional) central gate using OR's current apogee vs threshold
         // if (!isAirbrakeAllowedToDeploy(status)) {
         //     // Optionally keep predictor clean / auto-stow here.
-        //     return true;
+        //     return true; 
         // }
 
         // 2) commanded deployment (use ACTUAL actuator state 'deploy')
@@ -141,129 +156,112 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     }
 
     // ── force/moment injection ─────────────────────────────────────────────
-    @Override
-    public AerodynamicForces postAerodynamicCalculation(
-            final SimulationStatus status,
-            final AerodynamicForces base) throws SimulationException {
+    // ── force/moment injection (OpenRocket 23.x signature) ─────────────────────────
+@Override
+public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
+                                                    final AerodynamicForces base)
+        throws SimulationException {
+    // Guards
+    if (aerodynamics == null || rocket == null || status == null || base == null) return base;
+    final double deployFrac = clamp01(this.deploy);
+    if (deployFrac <= 1e-6) return base;
 
-        // 0) bailouts
-        if (aerodynamics == null || base == null) return base;
-        if (deploy <= 1e-6) return base;
+    // Kinematics
+    final Coordinate vel = status.getRocketVelocity();
+    final Coordinate pos = status.getRocketPosition();
+    final double V   = (vel != null) ? vel.length() : 0.0;
+    final double alt = (pos != null) ? pos.z : 0.0;
+    if (!Double.isFinite(V) || V < 1e-6) return base;
 
-        // 1) Mach (guard early-time NaNs)
-        double M = 0.0;
-        try {
-            double m = status.getFlightData().getLast(FlightDataType.TYPE_MACH_NUMBER);
-            if (Double.isFinite(m)) M = m;
-        } catch (Throwable ignored) { /* leave M = 0 */ }
+    // Density (ISA) and Mach
+    double rho = 1.225;
+    try { rho = com.airbrakesplugin.util.AirDensity.rhoISA(alt); }
+    catch (Throwable ignore) {
+        try { rho = com.airbrakesplugin.util.AirDensity.rhoISA(alt); }
+        catch (Throwable ignore2) { /* keep sea-level default */ }
+    }
+    double M = 0.0;
+    try {
+        final double m = status.getFlightDataBranch().getLast(FlightDataType.TYPE_MACH_NUMBER);
+        if (Double.isFinite(m)) M = m;
+    } catch (Throwable ignore) { /* M=0 */ }
 
-        // 2) ΔC lookup — table may expect 0..100 (%). Try % first, then fraction fallback.
-        final double uPct = deploy * 100.0;
-        double dCd = aerodynamics.getIncrementalCd(M, uPct);
-        double dCm = aerodynamics.getIncrementalCm(M, uPct);
+    // Interpolated coefficient increments — table may be fraction [0..1] or percent [0..100]
+    double dCd = aerodynamics.getIncrementalCd(M, deployFrac);
+    double dCm = aerodynamics.getIncrementalCm(M, deployFrac);
+    if ((Math.abs(dCd) + Math.abs(dCm)) < 1e-12 && deployFrac > 1e-3) {
+        dCd = aerodynamics.getIncrementalCd(M, 100.0 * deployFrac);
+        dCm = aerodynamics.getIncrementalCm(M, 100.0 * deployFrac);
+    }
+    if (!Double.isFinite(dCd) && !Double.isFinite(dCm)) return base;
 
-        if ((!Double.isFinite(dCd) || !Double.isFinite(dCm)) ||
-            (Math.abs(dCd) + Math.abs(dCm) < 1e-10 && deploy > 1e-3)) {
-            // fallback: table might actually be 0..1
-            dCd = aerodynamics.getIncrementalCd(M, deploy);
-            dCm = aerodynamics.getIncrementalCm(M, deploy);
-        }
+    // Dynamic pressure and increments
+    final double q = 0.5 * rho * V * V;
 
-        if (!Double.isFinite(dCd) || !Double.isFinite(dCm)) {
-            // nothing we can do safely
-            return base;
-        }
-
-        // 3) ΔF, ΔM from q, Sref, Lref
-        final Coordinate v = status.getRocketVelocity();
-        final double V   = (v != null) ? v.length() : 0.0;
-        if (!(Double.isFinite(V)) || V < 1e-3) return base;
-
-        double rho;
-        try {
-            // prefer your density util with current altitude
-            rho = AirDensity.getAirDensityAtAltitude(status.getRocketPosition().z);
-        } catch (Throwable t) {
-            rho = 1.225; // sea level fallback
-        }
-
-        final double q   = 0.5 * rho * V * V;
-        final double dF_drag_mag = dCd * q * Sref;        // N
-        final double dM_pitch    = dCm * q * Sref * Lref; // N·m
-
-        // Drag direction: opposite velocity
-        Coordinate vhat = (v == null || v.length() < 1e-9) ? new Coordinate(-1, 0, 0)
-                                                           : v.multiply(1.0 / v.length());
-        final Coordinate dF = vhat.multiply(-dF_drag_mag);
-        final Coordinate dM = new Coordinate(0.0, dM_pitch, 0.0); // sign may need flip per Cm sign convention
-
-        // 4) Try FORCE/MOMENT injection via reflection if this build supports it
-        try {
-            // Preferred path: read base vectors, add increments, return new AerodynamicForces(F,M,CP)
-            Method getForceM  = base.getClass().getMethod("getForce");
-            Method getMomentM = base.getClass().getMethod("getMoment");
-            Coordinate Fbase  = (Coordinate) getForceM.invoke(base);
-            Coordinate Mbase  = (Coordinate) getMomentM.invoke(base);
-
-            Coordinate Ftot = (Fbase == null) ? dF : Fbase.add(dF);
-            Coordinate Mtot = (Mbase == null) ? dM : Mbase.add(dM);
-
-            // CP getter (handle CP / Cp)
-            Coordinate cp = null;
-            try { cp = (Coordinate) base.getClass().getMethod("getCP").invoke(base); }
-            catch (Throwable ignored) {
-                try { cp = (Coordinate) base.getClass().getMethod("getCp").invoke(base); }
-                catch (Throwable ignored2) { cp = null; }
-            }
-
-            Constructor<?> ctor = findCtor(base.getClass(),
-                    Coordinate.class, Coordinate.class, Coordinate.class);
-            if (ctor != null && cp != null) {
-                return (AerodynamicForces) ctor.newInstance(Ftot, Mtot, cp);
-            }
-
-            // Secondary: mutating setters if present
-            try {
-                Method setForce  = base.getClass().getMethod("setForce", Coordinate.class);
-                Method setMoment = base.getClass().getMethod("setMoment", Coordinate.class);
-                setForce.invoke(base, Ftot);
-                setMoment.invoke(base, Mtot);
-                return base;
-            } catch (NoSuchMethodException ignored) {
-                // fall through to coefficient augmentation
-            }
-        } catch (NoSuchMethodException nsme) {
-            // This build likely has no vector API — fall back below
-        } catch (Throwable t) {
-            // Any reflection failure → fall back
-        }
-
-        // 5) Fallback: coefficient augmentation (still influences sim)
-        try {
-            // CD
-            double cd0 = 0.0;
-            try { cd0 = (double) base.getClass().getMethod("getCD").invoke(base); } catch (Throwable ignored) {}
-            try { base.getClass().getMethod("setCD", double.class).invoke(base, cd0 + dCd); } catch (Throwable ignored) {}
-
-            // CM / Cm (pitch moment coefficient)
-            Double cm0 = null;
-            try { cm0 = (Double) base.getClass().getMethod("getCM").invoke(base); } catch (Throwable ignored) {}
-            if (cm0 == null) {
-                try { cm0 = (Double) base.getClass().getMethod("getCm").invoke(base); } catch (Throwable ignored) {}
-            }
-            if (cm0 == null) cm0 = 0.0;
-
-            boolean setOk = false;
-            try { base.getClass().getMethod("setCM", double.class).invoke(base, cm0 + dCm); setOk = true; } catch (Throwable ignored) {}
-            if (!setOk) {
-                try { base.getClass().getMethod("setCm", double.class).invoke(base, cm0 + dCm); } catch (Throwable ignored) {}
-            }
-        } catch (Throwable ignored) { /* best effort */ }
-
-        return base;
+    // Incremental drag: opposite to velocity
+    Coordinate dF = Coordinate.NUL;
+    if (dCd != 0.0) {
+        final Coordinate vhat = new Coordinate(vel.x / V, vel.y / V, vel.z / V);
+        final double mag = q * Sref * dCd;
+        dF = new Coordinate(-mag * vhat.x, -mag * vhat.y, -mag * vhat.z);
     }
 
-    // ── life-cycle: end ────────────────────────────────────────────────────
+    // Incremental pitching moment about +Y (OpenRocket: X fore-aft, Y pitch, Z up)
+    Coordinate dM = Coordinate.NUL;
+    if (dCm != 0.0) {
+        final double dMmag = dCm * q * Sref * Lref;
+        dM = new Coordinate(0.0, dMmag, 0.0);
+    }
+
+    if (dF == Coordinate.NUL && dM == Coordinate.NUL) return base;
+
+    // Try to return a NEW AerodynamicForces(F, M, CP)
+    try {
+        final Method getForce  = base.getClass().getMethod("getForce");
+        final Method getMoment = base.getClass().getMethod("getMoment");
+        final Method getCP     = base.getClass().getMethod("getCP");
+        final Coordinate F0 = (Coordinate) getForce.invoke(base);
+        final Coordinate M0 = (Coordinate) getMoment.invoke(base);
+        final Coordinate CP = (Coordinate) getCP.invoke(base);
+        final Coordinate Ftot = (F0 != null ? F0 : Coordinate.NUL).add(dF);
+        final Coordinate Mtot = (M0 != null ? M0 : Coordinate.NUL).add(dM);
+
+        final Constructor<?> ctor = findCtor(base.getClass(),
+                Coordinate.class, Coordinate.class, Coordinate.class);
+        if (ctor != null && CP != null) {
+            return (AerodynamicForces) ctor.newInstance(Ftot, Mtot, CP);
+        }
+    } catch (Throwable ignore) { /* fall through */ }
+
+    // Otherwise, mutate in place if setters exist
+    try {
+        final Method setForce  = base.getClass().getMethod("setForce", Coordinate.class);
+        final Method setMoment = base.getClass().getMethod("setMoment", Coordinate.class);
+        final Method getForce  = base.getClass().getMethod("getForce");
+        final Method getMoment = base.getClass().getMethod("getMoment");
+        final Coordinate F0 = (Coordinate) getForce.invoke(base);
+        final Coordinate M0 = (Coordinate) getMoment.invoke(base);
+        final Coordinate Ftot = (F0 != null ? F0 : Coordinate.NUL).add(dF);
+        final Coordinate Mtot = (M0 != null ? M0 : Coordinate.NUL).add(dM);
+        setForce.invoke(base, Ftot);
+        setMoment.invoke(base, Mtot);
+        return base;
+    } catch (Throwable ignore) { /* last resort below */ }
+
+    // Last resort: bump CD/CM coefficients if present (still influences sim)
+    try {
+        Double cd0 = 0.0, cm0 = 0.0;
+        try { cd0 = (Double) base.getClass().getMethod("getCD").invoke(base); } catch (Throwable ignored) {}
+        try { cm0 = (Double) base.getClass().getMethod("getCM").invoke(base); } catch (Throwable ignored) {}
+        try { if (cd0 != null) base.getClass().getMethod("setCD", double.class).invoke(base, cd0 + dCd); } catch (Throwable ignored) {}
+        try { if (cm0 != null) base.getClass().getMethod("setCM", double.class).invoke(base, cm0 + dCm); } catch (Throwable ignored) {}
+    } catch (Throwable ignored) {}
+
+    return base;
+}
+
+
+    // ── life-cycle: end ────────────────────────
     @Override
     public void endSimulation(final SimulationStatus status, final SimulationException e) {
         if (e != null) log.error("Simulation ended with error", e);
@@ -292,7 +290,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     /** Best-effort retrieval of OpenRocket's apogee value at the current step. */
     private static double getOpenRocketApogee(final SimulationStatus st) {
-        if (st == null || st.getFlightData() == null) return Double.NaN;
+        if (st == null || st.getFlightDataBranch() == null) return Double.NaN;
 
         // Try a few likely FlightDataType constants in order of preference
         final String[] candidates = new String[] {
@@ -311,16 +309,16 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     /** Reflective getter to avoid compile-time dependency on specific FlightDataType constants. */
     private static Double tryFlightDatum(final SimulationStatus st, final String constName) {
         try {
-            java.lang.reflect.Field f = net.sf.openrocket.simulation.FlightDataType.class.getField(constName);
+            java.lang.reflect.Field f = info.openrocket.core.simulation.FlightDataType.class.getField(constName);
             Object ft = f.get(null);
-            if (ft instanceof net.sf.openrocket.simulation.FlightDataType) {
-                double val = st.getFlightData().getLast((net.sf.openrocket.simulation.FlightDataType) ft);
+            if (ft instanceof info.openrocket.core.simulation.FlightDataType) {
+                double val = st.getFlightDataBranch().getLast((info.openrocket.core.simulation.FlightDataType) ft);
                 return Double.isFinite(val) ? val : null;
             }
-        } catch (Throwable ignored) { }
+        } catch (Throwable ignore) {}
         return null;
     }
-
+    
     // Helper: find a constructor by parameter types
     private static Constructor<?> findCtor(Class<?> cls, Class<?>... params) {
         try {

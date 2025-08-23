@@ -61,9 +61,6 @@ public class AirbrakeConfig {
     public double getReferenceLength()               { return referenceLength; }
     public void   setReferenceLength(double len)     { this.referenceLength = len; }
 
-    public double getMaxDeploymentRate()             { return maxDeploymentRate; }
-    public void   setMaxDeploymentRate(double rate)  { this.maxDeploymentRate = rate; }
-
     public double getTargetApogee()                  { return targetApogee; }
     public void   setTargetApogee(double apogee)     { this.targetApogee = apogee; }
 
@@ -94,7 +91,6 @@ public class AirbrakeConfig {
                 "cfdDataFilePath='" + cfdDataFilePath + '\'' +
                 ", referenceArea=" + referenceArea +
                 ", referenceLength=" + referenceLength +
-                ", maxDeploymentRate=" + maxDeploymentRate +
                 ", targetApogee=" + targetApogee +
                 ", deployAltitudeThreshold=" + deployAltitudeThreshold +
                 ", maxMachForDeployment=" + maxMachForDeployment +

@@ -1,7 +1,7 @@
 package com.airbrakesplugin; 
 
-import net.sf.openrocket.plugin.Plugin;
-import net.sf.openrocket.simulation.extension.AbstractSimulationExtensionProvider;
+import info.openrocket.core.plugin.Plugin;
+import info.openrocket.core.simulation.extension.AbstractSimulationExtensionProvider;
 // import net.sf.openrocket.simulation.extension.SimulationExtension; // Not directly needed here
 
 @Plugin // Corrected annotation

@@ -1,10 +1,10 @@
 package com.airbrakesplugin;
 
-import net.sf.openrocket.rocketcomponent.Rocket;
-import net.sf.openrocket.simulation.SimulationConditions;
-import net.sf.openrocket.simulation.exception.SimulationException;
-import net.sf.openrocket.simulation.extension.AbstractSimulationExtension;
-import net.sf.openrocket.simulation.listeners.SimulationListener;
+import info.openrocket.core.rocketcomponent.Rocket;
+import info.openrocket.core.simulation.SimulationConditions;
+import info.openrocket.core.simulation.exception.SimulationException;
+import info.openrocket.core.simulation.extension.AbstractSimulationExtension;
+import info.openrocket.core.simulation.listeners.SimulationListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -76,13 +76,6 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     }
     public void setReferenceLength(double l) {
         config.setReferenceLength(l); fireChangeEvent(); 
-    } 
-
-    public double getMaxDeploymentRate() {
-        return config.getMaxDeploymentRate(); 
-    }
-    public void setMaxDeploymentRate(double r) {
-        config.setMaxDeploymentRate(r); fireChangeEvent(); 
     } 
 
     public double getTargetApogee() {

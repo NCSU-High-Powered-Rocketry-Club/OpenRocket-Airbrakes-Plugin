@@ -4,7 +4,7 @@ plugins {
 }
 
 // Diagnostic check for OpenRocket JAR
-def openRocketJarName = 'OpenRocket-23.09.jar' // Using the version from your compileOnly dependency
+def openRocketJarName = 'OpenRocket-24.12.jar' // Using the version from your compileOnly dependency
 def openRocketJarPath = "libs/${openRocketJarName}"
 def openRocketJarFileForCheck = file(openRocketJarPath)
 

@@ -1,295 +1,339 @@
 package com.airbrakesplugin;
 
-import net.sf.openrocket.simulation.SimulationStatus;
-import net.sf.openrocket.simulation.FlightDataType;
+import info.openrocket.core.simulation.SimulationStatus;
+import info.openrocket.core.simulation.FlightDataType;
+import info.openrocket.core.simulation.FlightDataBranch;
+import info.openrocket.core.util.Coordinate;
+
 import org.apache.commons.math3.analysis.ParametricUnivariateFunction;
 import org.apache.commons.math3.fitting.SimpleCurveFitter;
 import org.apache.commons.math3.fitting.WeightedObservedPoint;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
 /**
- * AirbrakeController – Bang-bang controlled by a realtime apogee predictor.
- *
- * Uses OpenRocket dt and vertical acceleration (if available) or dv/dt fallback.
- * Gates on motor-burning, ascent-only, deploy-altitude threshold, and Mach cap.
- * Fits to NET vertical acceleration and integrates directly (no extra g subtraction).
- * Emits DEBUG logs for predicted apogee, mode (FIT vs BALLISTIC), convergence and gating.
+ * AirbrakeController (OpenRocket 24.12 compatible)
+ * - Reads state via SimulationStatus (core API)
+ * - Detects thrust using FlightData.getLast(FlightDataType.TYPE_THRUST_FORCE)
+ * - Predicts apogee with curve-fit + ballistic fallback
+ * - Bang-bang with deadband around a target apogee
  */
-public class AirbrakeController {
+public final class AirbrakeController {
 
     private static final Logger log = LoggerFactory.getLogger(AirbrakeController.class);
 
-    // Physical constants (for ballistic fallback)
-    private static final double G0 = 9.80665;
-    private static final double EARTH_RADIUS = 6_371_000.0;
+    public interface ControlContext {
+        default void extend_airbrakes() {}
+        default void retract_airbrakes() {}
+        /** Optional hook: restore altitude source to pressure after retract */
+        default void switch_altitude_back_to_pressure() {}
+    }
 
-    private static final double DEFAULT_TOLERANCE = 10.0;     // ±m deadband
-    private static final int    MIN_PACKETS       = 12;       // samples before fit
-    private static final double MAX_RMSE_FOR_CONV = 1.2;      // m/s²
+    private final AirbrakeConfig config;
+    private ControlContext context;
 
-    // We fit & integrate NET vertical acceleration in coast (dvz/dt).
-    private static final boolean FIT_IS_NET_ACCEL = true;
+    // State
+    private Double lastVz = null;     // previous-step vertical speed (m/s)
+    private Double lastTime = null;   // previous-step sim time (s)
+    private boolean airbrakesExtended = false;
+    private Coordinate lastVel = null; // Add this field to store previous velocity vector
 
-    private final AirbrakeConfig  config;
-    private final ApogeePredictor predictor;
+    // Predictor
+    private final ApogeePredictor predictor = new ApogeePredictor();
 
-    private Double lastVz = null;      // used only if azFromOR is invalid
+    // Tuning
+    private static final int    MIN_PACKETS_FOR_FIT = 15;
+    private static final double MAX_RMSE_FOR_CONV   = 1.2;   // m/s^2
+    private static final double SMOOTH_ALPHA        = 0.5;   // EMA smoothing
 
-    // Toggle logging at runtime if needed
-    private boolean debugEnabled = true;
+    // Telemetry
+    private double lastPredictedApogee = Double.NaN;
 
     public AirbrakeController(final AirbrakeConfig config) {
         this.config = config;
-        this.predictor = new ApogeePredictor();
     }
 
-    public void setDebugEnabled(boolean enabled) {
-        this.debugEnabled = enabled;
+    public void setContext(ControlContext ctx) {
+        this.context = ctx;
     }
 
     /**
-     * Controller entry point.
+     * Returns the commanded deployment fraction in [0,1].
+     * Bang-bang with deadband: extend if predicted apogee > target + tol; retract if < target - tol.
+     * Inside [target - tol, target + tol], hold current state.
+     *
      */
-    public double getCommandedDeployment(
-            final double alt,
-            final double vz,
-            final double azFromOR,
-            final double mach,
-            final double currentDeployment,
-            final double dt,
-            final SimulationStatus status) {
+    public double getCommandedDeployment(final double alt_m,
+                                         final double vz_input,
+                                         final double azFromOR_mps2,
+                                         final double mach,
+                                         final double currentDeployment,
+                                         final double dt,
+                                         final SimulationStatus status) {
 
-        final double h = (Double.isFinite(dt) && dt > 1e-6) ? dt : 1e-2;
-
-        // Always-open diagnostic mode (via reflection, if present)
-        if (isAlwaysOpenMode()) {
-            if (debugEnabled && log.isDebugEnabled()) {
-                log.debug("[AIRBRAKE] Always-open mode active → forcing deployment={}",
-                        clamp01(getAlwaysOpenPercentage()));
+        final boolean debugEnabled = (log != null && log.isDebugEnabled());
+        final double t = finiteOr(status != null ? status.getSimulationTime() : Double.NaN, 0.0);
+        
+        // --- Read kinematics (24.12 SimulationStatus getters) ---
+        final Coordinate vVec = (status != null) ? status.getRocketVelocity() : null;
+        Coordinate vNow = vVec;  // Create an alias for clarity
+        
+        // Calculate acceleration if not provided by OR
+        Coordinate aVec = null;
+        if (vNow != null &&  Double.isFinite(vNow.x) && Double.isFinite(vNow.y) && Double.isFinite(vNow.z) && lastVel != null && dt > 1e-6) {
+            double ax = (vNow.x - lastVel.x) / dt;
+            double ay = (vNow.y - lastVel.y) / dt;
+            double az = status.getFlightDataBranch().getLast(FlightDataType.TYPE_ACCELERATION_Z);
+            aVec = new Coordinate(ax, ay, az);
+            if (debugEnabled) {
+                log.debug("Calculated acceleration: ({}, {}, {})", ax, ay, az);
             }
-            return clamp01(getAlwaysOpenPercentage());
+        }
+        // Save current velocity for next step
+        lastVel = (vNow != null) ? vNow : lastVel;
+        
+
+        // World-Z vertical speed (prefer SimulationStatus over the input hint); pitch only for logs
+        double vz   = vz_input;
+        double vmag = 0.0;
+        double pitchDeg = 0.0;
+        if (vVec != null && Double.isFinite(vVec.x) && Double.isFinite(vVec.y) && Double.isFinite(vVec.z)) {
+            vmag = vVec.length();
+            vz   = vVec.z;
+            if (vmag > 1e-6) {
+                final double cosToZ = clamp(vz / vmag, -1.0, 1.0);
+                pitchDeg = Math.toDegrees(Math.acos(cosToZ));
+            }
         }
 
-        // Safety / interlocks (deploy only in safe, ascending coast)
-        final boolean burning = isMotorBurning(status);
-        final boolean descending = (vz <= 0.0);
-        final double altThresh = getDeployAltitudeThreshold();
-        final boolean belowThresh = (alt < altThresh);
-        final double machMax = getMaxMachForDeployment();
-        final boolean overMach = (mach > machMax);
-
-        if (burning || descending || belowThresh || overMach) {
-            predictor.reset(); // keep fit clean
-            lastVz = vz;
-
-            if (debugEnabled && log.isDebugEnabled()) {
-                log.debug("[AIRBRAKE] Gate/stow: burning={} descending={} belowThresh({}<{})={} overMach({}>{})={} → cmd=0",
-                        burning, descending, alt, altThresh, belowThresh, mach, machMax, overMach);
-            }
+        // ---------- SAFETY GATES ----------
+        if (vz <= 0.0) { // descending
+            airbrakesExtended = false;
+            updateLastState(vz, t);
             return 0.0;
         }
+        if (config.getDeployAltitudeThreshold() > 0.0 && alt_m < config.getDeployAltitudeThreshold()) {
+            airbrakesExtended = false;
+            updateLastState(vz, t);
+            return 0.0;
+        }
+        try {
+            final double machCap = config.getMaxMachForDeployment();
+            if (machCap > 0.0 && Double.isFinite(mach) && mach > machCap) {
+                airbrakesExtended = false;
+                updateLastState(vz, t);
+                return 0.0;
+            }
+        } catch (Throwable ignored) { /* older configs might not define this */ }
 
-        // Compute net vertical acceleration (prefer OR's; else dv/dt)
-        final double aVertical = Double.isFinite(azFromOR)
-                ? azFromOR
-                : (lastVz == null ? 0.0 : (vz - lastVz) / h);
-        lastVz = vz;
-
-        // Update predictor and compute apogee
-        predictor.update(aVertical, h, alt, vz);
-
-        final double predictedApogee = predictor.getPredictedApogee();
-        final String  mode           = predictor.getLastMode();         // "FIT" or "BALLISTIC"
-        final boolean converged      = predictor.hasConverged();
-        final double  rmse           = predictor.getLastRmse();         // NaN when not available
-        final double[] coeffs        = predictor.getLastCoeffs();
-
-        final double tolerance       = getApogeeToleranceMeters();
-        final double targetApogee    = getTargetApogee();
-        final double error           = predictedApogee - targetApogee;
-
-        // For context, also log OR's own apogee (best-effort)
-        final double orApogee = getOpenRocketApogee(status);
-
-        if (debugEnabled && log.isDebugEnabled()) {
-            final Object rmseLog = Double.isFinite(rmse) ? rmse : "n/a";
-            final Object aLog = (coeffs != null && coeffs.length > 0 && Double.isFinite(coeffs[0])) ? coeffs[0] : "n/a";
-            final Object bLog = (coeffs != null && coeffs.length > 1 && Double.isFinite(coeffs[1])) ? coeffs[1] : "n/a";
-
-            log.debug("[APOGEE] mode={} pred={}m OR={}m target={}m tol=±{}m err={}m conv={} rmse={} A={} B={} | alt={} vz={} az={} dt={} M={}",
-                    mode,
-                    safeD(predictedApogee), safeD(orApogee), safeD(targetApogee), safeD(tolerance), safeD(error),
-                    converged, rmseLog, aLog, bLog,
-                    safeD(alt), safeD(vz), safeD(aVertical), safeD(h), safeD(mach));
+        // ---------- BUILD DRAG-ONLY VERTICAL DECEL ----------
+        // Prefer finite-difference net vertical accel (includes gravity), else fall back to OR accel hints
+        double az_net = Double.NaN;
+        if (lastVz != null && dt > 1e-6 && Double.isFinite(vz)) {
+            az_net = (vz - lastVz) / dt; // includes gravity
+        } else if (aVec != null && Double.isFinite(aVec.z)) {
+            az_net = aVec.z;             // use OR-provided accel
+        } else if (Double.isFinite(azFromOR_mps2)) {
+            az_net = azFromOR_mps2;      // last resort
         }
 
-        // Bang-bang with deadband
-        if (error >  tolerance) return 1.0; // overshoot → brake
-        if (error < -tolerance) return 0.0; // undershoot → stow
-        return currentDeployment;           // inside deadband → hold
-    }
+        final double g = gravityAt(alt_m);
 
-    public double getPredictedApogeeDebug() {
-        return predictor != null ? predictor.getPredictedApogee() : Double.NaN;
-    }
-
-    // ───────────────────────────────────────────────────────────────────
-    // Reflection wrappers for config compatibility
-    // ───────────────────────────────────────────────────────────────────
-    private boolean isAlwaysOpenMode() {
+        // ---------- COAST-AWARE GATE ----------
+        boolean thrusting = false;
         try {
-            Method m = config.getClass().getMethod("isAlwaysOpenMode");
-            return (boolean) m.invoke(config);
-        } catch (Exception ignored) { return false; }
-    }
-
-    private double getAlwaysOpenPercentage() {
-        try {
-            Method m;
-            try { m = config.getClass().getMethod("getAlwaysOpenPercentage"); }
-            catch (NoSuchMethodException e) { m = config.getClass().getMethod("getAlwaysOpenPercent"); }
-            return (double) m.invoke(config);
-        } catch (Exception ignored) { return 1.0; }
-    }
-
-    private double getDeployAltitudeThreshold() {
-        try {
-            Method m = config.getClass().getMethod("getDeployAltitudeThreshold");
-            return (double) m.invoke(config);
-        } catch (Exception ignored) { return 0.0; }
-    }
-
-    private double getMaxMachForDeployment() {
-        try {
-            Method m = config.getClass().getMethod("getMaxMachForDeployment");
-            return (double) m.invoke(config);
-        } catch (Exception ignored) { return Double.MAX_VALUE; }
-    }
-
-    private double getTargetApogee() {
-        try {
-            Method m = config.getClass().getMethod("getTargetApogee");
-            return (double) m.invoke(config);
-        } catch (Exception ignored) { return 0.0; }
-    }
-
-    private double getApogeeToleranceMeters() {
-        try {
-            Method mOpt = config.getClass().getMethod("getApogeeToleranceMeters");
-            Object v = mOpt.invoke(config);
-            if (v instanceof Optional<?>) {
-                Optional<?> o = (Optional<?>) v;
-                if (o.isPresent() && o.get() instanceof Double) return (Double) o.get();
-                return DEFAULT_TOLERANCE;
+            if (status != null) {
+                // OpenRocket 24.12 API uses direct accessor methods instead of getFlightData/getLast pattern
+                double thrustN = 0.0;
+                
+                // Method 1: Try using direct thrust accessor if available
+                try {
+                    thrustN = status.getFlightDataBranch().getLast(FlightDataType.TYPE_THRUST_FORCE);
+                } catch (Throwable e) {
+                    // Method 2: Try accessing flight data through new API
+                    try {
+                        thrustN = status.getFlightDataBranch().getLast(FlightDataType.TYPE_THRUST_FORCE);
+                    } catch (Throwable e2) {
+                        // Method 3: Try getting last value if available through FlightDataBranch
+                        if (status.getFlightDataBranch() != null) {
+                            thrustN = status.getFlightDataBranch().getLast(FlightDataType.TYPE_THRUST_FORCE);
+                        }
+                    }
+                }
+                
+                thrusting = Double.isFinite(thrustN) && thrustN > 1.0;
+                
+                if (log != null && log.isDebugEnabled()) {
+                    log.debug("Thrust detection: thrustN={}, thrusting={}", thrustN, thrusting);
+                }
             }
-            if (v instanceof Double) return (Double) v;
-        } catch (Exception ignored) { }
-        return DEFAULT_TOLERANCE;
-    }
-
-    // ───────────────────────────────────────────────────────────────────
-    // Burn/Coast gating – robust to OR API differences
-    // ───────────────────────────────────────────────────────────────────
-    private boolean isMotorBurning(SimulationStatus status) {
-        // 1) Preferred: explicit API (when available)
-        try {
-            Method m = status.getClass().getMethod("isMotorBurning");
-            return (boolean) m.invoke(status);
-        } catch (Exception ignored) { /* fall through */ }
-
-        // 2) Fallback: thrust > ~0.5 N from FlightData (if available)
-        try {
-            double thrust = status.getFlightData().getLast(FlightDataType.TYPE_THRUST_FORCE);
-            return Double.isFinite(thrust) && thrust > 0.5;
-        } catch (Throwable ignored) { }
-
-        // 3) Unknown → assume not burning
-        return false;
-    }
-
-    // ───────────────────────────────────────────────────────────────────
-    // Utilities
-    // ───────────────────────────────────────────────────────────────────
-    private static double clamp01(double v) {
-        return (v < 0) ? 0 : (v > 1 ? 1 : v);
-    }
-
-    private static double gravity(double altitude) {
-        final double r = EARTH_RADIUS + Math.max(0.0, altitude);
-        return G0 * (EARTH_RADIUS * EARTH_RADIUS) / (r * r);
-    }
-
-    private static Double safeD(double v) {
-        return Double.isFinite(v) ? v : null;
-    }
-
-    // Read OR's current apogee (best-effort; varies by build)
-    private static double getOpenRocketApogee(final SimulationStatus st) {
-        if (st == null || st.getFlightData() == null) return Double.NaN;
-        final String[] candidates = new String[] {
-                "TYPE_APOGEE",
-                "TYPE_MAX_ALTITUDE",
-                "TYPE_APOGEE_ESTIMATE",
-                "TYPE_APOGEE_PREDICTION"
-        };
-        for (String name : candidates) {
-            Double v = tryFlightDatum(st, name);
-            if (v != null) return v;
+        } catch (Throwable ignored) {
+            // Fall back to acceleration-based detection (existing code)
         }
-        return Double.NaN;
-    }
 
-    private static Double tryFlightDatum(final SimulationStatus st, final String constName) {
+        // Keep the acceleration-based detection as a fallback
+        if (!thrusting) {
+            // Heuristic fallback: during powered ascent, net vertical accel >> −g
+            try {
+                thrusting = Double.isFinite(az_net) && (az_net > -0.5 * g);
+            } catch (Throwable ignored) {}
+        }
+
+        if (thrusting) {
+            // Avoid polluting the fit during thrust; hold current state
+            updateLastState(vz, t);
+            return airbrakesExtended ? openFraction() : 0.0;
+        }
+
+        // Coast regime: az_net ≈ −g − drag_z  ⇒ drag magnitude = −(az_net + g)
+        double a_drag_vert = 0.0;
+        if (vz > 0.0 && Double.isFinite(az_net)) {
+            a_drag_vert = Math.max(0.0, -(az_net + g));
+        }
+        if (a_drag_vert < 0.01) a_drag_vert = 0.0;
+
+        // Smooth the decel before feeding the predictor (EMA)
+        final double a_smooth = predictor.hasSamples()
+                ? (1.0 - SMOOTH_ALPHA) * predictor.peekLastAccel() + SMOOTH_ALPHA * a_drag_vert
+                : a_drag_vert;
+
+        predictor.update(alt_m, vz, a_smooth, dt);
+
+        // ---------- PREDICT APEX ----------
+        double predicted = predictor.predictApogee(alt_m, vz, MIN_PACKETS_FOR_FIT, MAX_RMSE_FOR_CONV);
+        lastPredictedApogee = predicted;
+
+        // Fallback if the fit is degenerate (NaN, ≈alt, or RMSE≈0 with zero accel)
+        final double rmse = predictor.getLastRmse();
+        final boolean degenerate = (!Double.isFinite(predicted))
+                || (predicted <= alt_m + 0.5)
+                || (rmse < 1e-6 && a_smooth == 0.0);
+
+        if (degenerate) {
+            final double a_eff = Math.max(0.25, a_smooth); // keep denominator sane
+            predicted = alt_m + (vz * vz) / (2.0 * (g + a_eff));
+            lastPredictedApogee = predicted;
+        }
+
+        final double target = finiteOr(config.getTargetApogee(), 1500.0);
+        double tol = 5.0;
         try {
-            java.lang.reflect.Field f = FlightDataType.class.getField(constName);
-            Object ft = f.get(null);
-            if (ft instanceof FlightDataType) {
-                double val = st.getFlightData().getLast((FlightDataType) ft);
-                return Double.isFinite(val) ? val : null;
+            final Optional<Double> opt = config.getApogeeToleranceMeters();
+            if (opt != null && opt.isPresent()) tol = opt.get();
+        } catch (Throwable ignored) {}
+
+        // ---------- BANG-BANG WITH DEADBAND ----------
+        if (Double.isFinite(predicted) && Double.isFinite(target)) {
+            // Extending increases drag ⇒ reduces apogee
+            if (!airbrakesExtended && predicted > target + tol) {
+                if (context != null) context.extend_airbrakes();
+                airbrakesExtended = true;
+                log.info("EXTENDING AIRBRAKES: apogee={}, target={}, tol={}", predicted, target, tol);
+            } else if (airbrakesExtended && predicted < target - tol) {
+                if (context != null) {
+                    context.retract_airbrakes();
+                    context.switch_altitude_back_to_pressure();
+                }
+                airbrakesExtended = false;
+                log.info("RETRACTING AIRBRAKES: apogee={}, target={}, tol={}", predicted, target, tol);
             }
-        } catch (Throwable ignored) { }
-        return null;
+            // else: within deadband → hold current state
+        } else {
+            // No reliable prediction yet → keep stowed while climbing
+            airbrakesExtended = false;
+        }
+
+        if (debugEnabled) {
+            log.debug(String.format(
+                    "[CTRL] t=%.2f alt=%.1f vz=%.2f pitch=%.1f° aFit=%.3f rmse=%.6f apogee=%.1f target=%.1f tol=%.1f extended=%s",
+                    t, alt_m, vz, pitchDeg, a_smooth, rmse, predicted, target, tol, airbrakesExtended));
+        }
+
+        updateLastState(vz, t);
+
+        // Commanded fraction (always-open overrides; else full-open when extended)
+        return airbrakesExtended ? openFraction() : 0.0;
     }
 
-    // ==================================================================
-    //                    Internal realtime predictor
-    // ==================================================================
-    private final class ApogeePredictor {
+    /** Latest apogee prediction (m). */
+    public double getLastPredictedApogee() {
+        return lastPredictedApogee;
+    }
 
-        // Fit model: a(t) = A (1 − B t)^4
-        private final ParametricUnivariateFunction CURVE = new ParametricUnivariateFunction() {
-            @Override public double value(double t, double... p) {
+    // ───────────────────────────── helpers ────────────────────────────────
+
+    private void updateLastState(double vz, double t) {
+        this.lastVz = vz;
+        this.lastTime = t;
+    }
+
+    private double openFraction() {
+        try {
+            if (config.isAlwaysOpenMode()) {
+                return clamp01(finiteOr(config.getAlwaysOpenPercentage(), 1.0));
+            }
+        } catch (Throwable ignored) {}
+        return 1.0;
+    }
+
+    private static double finiteOr(double val, double fallback) {
+        return Double.isFinite(val) ? val : fallback;
+    }
+
+    private static double clamp(double x, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, x));
+    }
+
+    private static double clamp01(double x) {
+        return clamp(x, 0.0, 1.0);
+    }
+
+    /** Gravity variation with altitude: g0*(Re/(Re+h))^2. */
+    private static double gravityAt(double alt_m) {
+        final double g0 = 9.80665, Re = 6_371_000.0;
+        final double f = Re / (Re + Math.max(0.0, alt_m));
+        return g0 * f * f;
+    }
+
+    // ─────────────────────── Apogee Predictor ───────────────────────
+
+    private static final class ApogeePredictor {
+
+        // Model a(t) = A * (1 - B t)^4  (positive deceleration magnitude)
+        private static final ParametricUnivariateFunction MODEL = new ParametricUnivariateFunction() {
+            @Override
+            public double value(double t, double[] p) {
                 final double A = p[0], B = p[1];
-                final double s = 1.0 - B * t;
+                final double s = Math.max(0.0, 1.0 - B * t);
                 return A * Math.pow(s, 4);
             }
-            @Override public double[] gradient(double t, double... p) {
+            @Override
+            public double[] gradient(double t, double[] p) {
                 final double A = p[0], B = p[1];
-                final double s = 1.0 - B * t;
-                return new double[]{ Math.pow(s, 4), -4.0 * A * t * Math.pow(s, 3) };
+                final double s = Math.max(0.0, 1.0 - B * t);
+                final double s3 = Math.pow(s, 3);
+                return new double[] { Math.pow(s, 4), -4.0 * A * t * s3 };
             }
         };
 
-        private final List<Double> accels = new ArrayList<>();
-        private final List<Double> dts    = new ArrayList<>();
+        private final List<Double> accels = new ArrayList<>(); // positive decel [m/s^2]
+        private final List<Double> dts    = new ArrayList<>(); // step sizes [s]
         private double currentAlt = 0.0;
         private double currentVel = 0.0;
 
         private boolean hasConverged = false;
-        private double[] coeffs = { 0.0, 0.0 };
-        private double lastRmse = Double.NaN;      // <- Option B: primitive with NaN
+        private double[] coeffs = { 0.0, 0.0 }; // A, B
+        private double lastRmse = Double.NaN;
 
         private List<Double> lutVel    = Collections.emptyList(); // ascending v
-        private List<Double> lutDeltaH = Collections.emptyList(); // Δh to apex
-
-        private String lastMode = "BALLISTIC"; // "FIT" when LUT path used
+        private List<Double> lutDeltaH = Collections.emptyList(); // Δh(v) to apex
+        private String lastMode = "BALLISTIC";
         private double lastPredictedApogee = Double.NaN;
 
         void reset() {
@@ -299,155 +343,125 @@ public class AirbrakeController {
             lutDeltaH = Collections.emptyList();
             hasConverged = false;
             coeffs[0] = coeffs[1] = 0.0;
-            lastRmse = Double.NaN;            // <- never null
+            lastRmse = Double.NaN;
             lastMode = "BALLISTIC";
             lastPredictedApogee = Double.NaN;
-
-            if (debugEnabled && log.isDebugEnabled()) {
-                log.debug("[APOGEE] predictor reset");
-            }
         }
 
-        void update(double accelNet, double dt, double altitude, double velocity) {
-            currentAlt = altitude;
-            currentVel = velocity;
-            if (!Double.isFinite(dt) || dt <= 1e-6) return;
+        boolean hasSamples() { return !accels.isEmpty(); }
+        double  peekLastAccel() { return accels.isEmpty() ? 0.0 : accels.get(accels.size() - 1); }
+        String  getLastMode() { return lastMode; }
+        double  getLastRmse() { return lastRmse; }
+        double  getLastPredictedApogee() { return lastPredictedApogee; }
 
-            if (Double.isFinite(accelNet)) {
-                accels.add(accelNet);
-                dts.add(dt);
-            }
-
-            if (!hasConverged && accels.size() >= MIN_PACKETS) {
-                fitCurve();
-            }
+        void update(double alt, double vz, double a_dec_pos, double dt) {
+            if (!Double.isFinite(alt) || !Double.isFinite(vz) || !Double.isFinite(a_dec_pos) || dt <= 0.0) return;
+            if (vz <= 0.0) return; // only ascent samples
+            currentAlt = alt;
+            currentVel = vz;
+            accels.add(Math.max(0.0, a_dec_pos));
+            dts.add(dt);
         }
 
-        double getPredictedApogee() {
-            if (hasConverged && !lutVel.isEmpty()) {
-                lastMode = "FIT";
-                lastPredictedApogee = currentAlt + interpDeltaH(currentVel);
+        double predictApogee(double alt, double vz, int minPackets, double maxRmse) {
+            if (!Double.isFinite(alt) || !Double.isFinite(vz)) {
+                lastPredictedApogee = Double.NaN;
+                lastMode = "BALLISTIC";
                 return lastPredictedApogee;
             }
-            // Fallback: ballistic (upper bound). Use local g(h).
-            lastMode = "BALLISTIC";
-            final double g = gravity(currentAlt);
-            lastPredictedApogee = currentAlt + (currentVel * currentVel) / (2.0 * g);
-            return lastPredictedApogee;
-        }
 
-        String   getLastMode()     { return lastMode; }
-        boolean  hasConverged()    { return hasConverged; }
-        double   getLastRmse()     { return lastRmse; }            // <- primitive
-        double[] getLastCoeffs()   { return coeffs != null ? coeffs.clone() : null; }
+            if (accels.size() >= minPackets) {
+                try {
+                    // Build time grid and fit A, B
+                    final List<WeightedObservedPoint> pts = new ArrayList<>(accels.size());
+                    double t = 0.0;
+                    for (int i = 0; i < accels.size(); i++) {
+                        pts.add(new WeightedObservedPoint(1.0, t, accels.get(i)));
+                        t += dts.get(i);
+                    }
+                    final double A0 = Math.max(0.1, accels.get(0));
+                    final double B0 = 0.02;
+                    final double[] p = SimpleCurveFitter.create(MODEL, new double[] { A0, B0 }).fit(pts);
 
-        // ------------------------ fitting & LUT ------------------------
-        private void fitCurve() {
-            final int n = accels.size();
-            double[] t = new double[n];
-            double cum = 0.0;
-            for (int i = 0; i < n; i++) { cum += dts.get(i); t[i] = cum; }
+                    // RMSE
+                    double sumsq = 0.0;
+                    t = 0.0;
+                    for (int i = 0; i < accels.size(); i++) {
+                        final double e = accels.get(i) - MODEL.value(t, p);
+                        sumsq += e * e;
+                        t += dts.get(i);
+                    }
+                    final double rmse = Math.sqrt(sumsq / Math.max(1, accels.size()));
 
-            List<WeightedObservedPoint> obs = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) {
-                obs.add(new WeightedObservedPoint(1.0, t[i], accels.get(i)));
-            }
-
-            // Initial guess: near measured mean accel and gentle decay
-            final double meanA = accels.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-            double[] guess = new double[]{ meanA, 0.02 };
-
-            try {
-                coeffs = SimpleCurveFitter.create(CURVE, guess).fit(obs);
-                lastRmse = computeRMSE(obs, coeffs);
-                hasConverged = (lastRmse < MAX_RMSE_FOR_CONV) &&
-                               Double.isFinite(coeffs[0]) && Double.isFinite(coeffs[1]);
-
-                if (debugEnabled && log.isDebugEnabled()) {
-                    log.debug("[APOGEE] fit A={} B={} rmse={} n={}",
-                            safeD(coeffs[0]), safeD(coeffs[1]),
-                            Double.isFinite(lastRmse) ? lastRmse : "n/a", n);
-                }
-
-                if (hasConverged) buildLookupTable();
-            } catch (Exception e) {
-                hasConverged = false;
-                lastRmse = Double.NaN;
-                if (debugEnabled && log.isDebugEnabled()) {
-                    log.debug("[APOGEE] fit failed: {}", e.toString());
+                    if (Double.isFinite(rmse) && rmse <= maxRmse && Double.isFinite(p[0]) && Double.isFinite(p[1]) && p[1] >= 0.0) {
+                        coeffs = p.clone();
+                        hasConverged = true;
+                        lastRmse = rmse;
+                        buildLut(coeffs);
+                    } else {
+                        hasConverged = false;
+                        lastRmse = rmse;
+                    }
+                } catch (Throwable fitErr) {
+                    hasConverged = false;
+                    lastRmse = Double.NaN;
                 }
             }
-        }
 
-        private double computeRMSE(List<WeightedObservedPoint> obs, double[] p) {
-            double sum = 0.0;
-            for (WeightedObservedPoint o : obs) {
-                double e = o.getY() - CURVE.value(o.getX(), p);
-                sum += e * e;
+            final double hApex;
+            if (hasConverged && !lutVel.isEmpty()) {
+                final double dh = interpDeltaH(vz);
+                hApex = alt + Math.max(0.0, dh);
+                lastMode = "FIT";
+            } else {
+                final double g = gravityAt(alt);
+                hApex = alt + Math.max(0.0, (vz * vz) / (2.0 * g));
+                lastMode = "BALLISTIC";
             }
-            return Math.sqrt(sum / Math.max(1, obs.size()));
+
+            lastPredictedApogee = hApex;
+            return hApex;
         }
 
-        private void buildLookupTable() {
-            List<Double> vOut = new ArrayList<>();
-            List<Double> hOut = new ArrayList<>();
-
+        private void buildLut(double[] p) {
+            final double A = p[0], B = p[1];
+            final double dt = 0.02;
             double v = Math.max(0.0, currentVel);
             double h = 0.0;
-            double time = 0.0;
-            final double dt = 0.02; // internal integrator step
 
-            // Integrate forward until v crosses zero or a reasonable cap
-            while (v > 0.0 && time < 40.0) {
-                double aFit = CURVE.value(time, coeffs);
-                final double aNet = FIT_IS_NET_ACCEL ? aFit : (aFit - gravity(currentAlt));
-                v += aNet * dt;
-                if (v < 0.0) break;
+            final List<Double> V = new ArrayList<>();
+            final List<Double> H = new ArrayList<>();
+            V.add(v); H.add(h);
+
+            double t = 0.0;
+            for (int i = 0; i < 20000 && v > 1e-4; i++) {
+                final double a = Math.max(0.0, MODEL.value(t, new double[] { A, B })); // decel magnitude
+                v = Math.max(0.0, v - a * dt); // dv/dt = -a during ascent
                 h += v * dt;
-                vOut.add(v);
-                hOut.add(h);
-                time += dt;
+                t += dt;
+
+                V.add(v);
+                H.add(h);
             }
 
-            if (vOut.isEmpty()) {
-                lutVel = Collections.emptyList();
-                lutDeltaH = Collections.emptyList();
-                hasConverged = false;
-                if (debugEnabled && log.isDebugEnabled()) {
-                    log.debug("[APOGEE] LUT build produced no points; back to ballistic");
-                }
-                return;
-            }
-
-            // Interpolation expects ascending velocity
-            Collections.reverse(vOut);
-            Collections.reverse(hOut);
-            lutVel = vOut;
-            lutDeltaH = hOut;
-
-            if (debugEnabled && log.isDebugEnabled()) {
-                log.debug("[APOGEE] LUT built: points={}", lutVel.size());
-            }
+            lutVel = V;
+            lutDeltaH = H;
         }
 
         private double interpDeltaH(double velocity) {
             if (lutVel.isEmpty()) return 0.0;
-            // clamp
-            if (velocity >= lutVel.get(lutVel.size()-1)) return lutDeltaH.get(lutDeltaH.size()-1);
-            if (velocity <= lutVel.get(0))              return lutDeltaH.get(0);
+            if (velocity <= lutVel.get(0)) return lutDeltaH.get(0);
+            if (velocity >= lutVel.get(lutVel.size() - 1)) return lutDeltaH.get(lutDeltaH.size() - 1);
 
-            // find bracket
             for (int i = 0; i < lutVel.size() - 1; i++) {
-                double v1 = lutVel.get(i);
-                double v2 = lutVel.get(i + 1);
+                final double v1 = lutVel.get(i), v2 = lutVel.get(i + 1);
                 if (velocity >= v1 && velocity <= v2) {
-                    double h1 = lutDeltaH.get(i);
-                    double h2 = lutDeltaH.get(i + 1);
-                    double f  = (velocity - v1) / (v2 - v1);
+                    final double h1 = lutDeltaH.get(i), h2 = lutDeltaH.get(i + 1);
+                    final double f  = (velocity - v1) / (v2 - v1);
                     return h1 + f * (h2 - h1);
                 }
             }
-            return lutDeltaH.get(lutDeltaH.size()-1);
+            return lutDeltaH.get(lutDeltaH.size() - 1);
         }
     }
 }
