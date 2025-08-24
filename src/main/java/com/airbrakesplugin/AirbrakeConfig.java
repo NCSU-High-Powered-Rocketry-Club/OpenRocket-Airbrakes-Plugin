@@ -38,12 +38,12 @@ public class AirbrakeConfig {
      * Constructor with default values.
      */
     public AirbrakeConfig() {
-        this.referenceArea = 0.0;            // m²
-        this.referenceLength = 0.0;          // m
-        this.maxDeploymentRate = 1.0;        // 1/s (fraction per second)
-        this.targetApogee = 0;           // m AGL
-        this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
-        this.maxMachForDeployment = 0.0;     // cap for supersonic
+        this.referenceArea = 0.008706;            // m²
+        this.referenceLength = 0.1016;          // m
+        this.maxDeploymentRate = 4.0;        // 1/s (fraction per second)
+        this.targetApogee = 540.0;           // m AGL
+        this.deployAltitudeThreshold = 1;   // m AGL – prevent ground tests
+        this.maxMachForDeployment = 4;     // cap for supersonic
         this.alwaysOpenMode = false;
         this.alwaysOpenPercentage = 1.0;       // 0–1
         this.apogeeToleranceMeters = null;
@@ -60,6 +60,9 @@ public class AirbrakeConfig {
 
     public double getReferenceLength()               { return referenceLength; }
     public void   setReferenceLength(double len)     { this.referenceLength = len; }
+
+    public double getMaxDeploymentRate()             { return maxDeploymentRate; }
+    public void   setMaxDeploymentRate(double rate)  { this.maxDeploymentRate = rate; }
 
     public double getTargetApogee()                  { return targetApogee; }
     public void   setTargetApogee(double apogee)     { this.targetApogee = apogee; }
@@ -91,6 +94,7 @@ public class AirbrakeConfig {
                 "cfdDataFilePath='" + cfdDataFilePath + '\'' +
                 ", referenceArea=" + referenceArea +
                 ", referenceLength=" + referenceLength +
+                ", maxDeploymentRate=" + maxDeploymentRate +
                 ", targetApogee=" + targetApogee +
                 ", deployAltitudeThreshold=" + deployAltitudeThreshold +
                 ", maxMachForDeployment=" + maxMachForDeployment +

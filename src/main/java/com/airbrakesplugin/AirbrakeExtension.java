@@ -114,8 +114,8 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
         config.setAlwaysOpenPercentage(p); fireChangeEvent(); 
     } 
 
-    public double getApogeeToleranceMeters() {
-        return config.getApogeeToleranceMeters().orElse(null); 
+    public Double getApogeeToleranceMeters() {
+        return config.getApogeeToleranceMeters().orElse(null);
     }
     public void setApogeeToleranceMeters(Double tol) {
         config.setApogeeToleranceMeters(tol); fireChangeEvent(); 
