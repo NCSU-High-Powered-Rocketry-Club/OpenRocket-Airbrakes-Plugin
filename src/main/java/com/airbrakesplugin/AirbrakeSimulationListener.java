@@ -11,8 +11,6 @@ import info.openrocket.core.simulation.exception.SimulationException;
 import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
 import info.openrocket.core.util.Coordinate;
 
-import com.airbrakesplugin.util.AirDensity;
-
 import java.lang.reflect.Method;
 import java.util.Objects;
 
@@ -45,6 +43,12 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private double lastTime_s = 0.0;
     private double deploy     = 0.0;   // physical actuator state [0..1]
     private double currentAirbrakeDeployment = 0.0;
+
+// Add near top of the class with other constants:
+    private static final double Q_RAMP_START_PA = 5.0;   // start applying effect ~5 Pa
+    private static final double Q_RAMP_FULL_PA  = 50.0;  // full effect by ~50 Pa
+    private static final double EPS_Q           = 1e-6;
+
 
     public AirbrakeSimulationListener(final AirbrakeConfig cfg, final Rocket rkt) {
         this.config = Objects.requireNonNull(cfg, "AirbrakeConfig must not be null");
@@ -123,59 +127,73 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     // ---- single-point coefficient injection (Waterloo pattern) -------------
     @Override
-    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status, final AerodynamicForces base) throws SimulationException {
+    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
+                                                        final AerodynamicForces base) throws SimulationException {
         if (aerodynamics == null || base == null || status == null) return base;
 
         final double deployFrac = clamp01(this.deploy);
         if (deployFrac <= 1e-6) return base;
 
-        // Velocity magnitude (just to gate tiny speeds)
+        // Velocity magnitude
         final Coordinate vel = status.getRocketVelocity();
         final double V = (vel != null) ? vel.length() : 0.0;
-        if (V < 0.5) return base;
+        if (!(V > 0.1)) return base; // avoid near-zero noise
 
-        // Alt & Mach (keep your density calculation)
-        final double alt  = safeGet(status, FlightDataType.TYPE_ALTITUDE,    0.0);
-        double mach       = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, 0.0);
+        // Altitude & Mach
+        final double alt = safeGet(status, FlightDataType.TYPE_ALTITUDE, 0.0);
+        double mach = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, Double.NaN);
         if (!Double.isFinite(mach) || mach <= 0) {
-            try { mach = status.getFlightDataBranch().getLast(FlightDataType.TYPE_MACH_NUMBER); } catch (Throwable ignore) { /* ok */ }
+            // Fallback: compute Mach from V & altitude using your AirDensity
+            mach = com.airbrakesplugin.util.AirDensity.machFromV(V, alt);
         }
-        final double rho  = AirDensity.rhoForDynamicPressure(alt, mach); // retained for consistency/logs
 
-        // Δcoeffs from your tables (snap/scale inside your class as needed)
-        double dCd = aerodynamics.getIncrementalCd(mach, deployFrac);
-        if (!Double.isFinite(dCd) || Math.abs(dCd) < 1e-12) return base;
+        // Dynamic pressure (compressibility-aware). Uses qc = Pt - p for M > 0.3, else ½ρV².
+        final double q = com.airbrakesplugin.util.AirDensity.dynamicPressureFromMach(alt, mach, V);
+        if (!(q > EPS_Q)) return base;
 
-        // Optional ΔCm (kept zero unless you have verified the axis mapping)
-        double dCm = 0.0;
+        // Δcoeffs from tables (binary deploy handled inside AirbrakeAerodynamics)
+        double dCd_tab = aerodynamics.getIncrementalCd(mach, deployFrac);
+        if (!Double.isFinite(dCd_tab) || Math.abs(dCd_tab) < 1e-12) return base;
+
+        double dCm_tab = 0.0;
         try {
-            double tmp = aerodynamics.getIncrementalCm(mach, deployFrac);
-            if (Double.isFinite(tmp)) dCm = tmp;
-        } catch (Throwable ignore) { /* ok: leave zero */ }
+            final double tmp = aerodynamics.getIncrementalCm(mach, deployFrac);
+            if (Double.isFinite(tmp)) dCm_tab = tmp;
+        } catch (Throwable ignore) { /* leave zero */ }
 
-        // ---- APPLY ΔCd (and ΔCm) BY REFLECTION ON AerodynamicForces ----------
-        boolean cdApplied = addToDoubleProperty(base,
-                dCd,
-                // common names across OR versions
+        // --- Force domain (apply ramp vs. very low-q) ---
+        final double ramp = qRampScale(q);                 // 0..1
+        final double dF   = ramp * (q * Sref * dCd_tab);   // N
+        final double dM   = ramp * (q * Sref * Lref * dCm_tab); // N·m
+
+        // --- Back to coefficients for OR update ---
+        final double inv_qS  = (q > EPS_Q && Sref > 0.0) ? (1.0 / (q * Sref)) : 0.0;
+        final double inv_qSL = (q > EPS_Q && Sref > 0.0 && Lref > 0.0) ? (1.0 / (q * Sref * Lref)) : 0.0;
+
+        final double dCd_eff = dF * inv_qS;     // == ramp * dCd_tab when valid
+        final double dCm_eff = dM * inv_qSL;    // == ramp * dCm_tab when valid
+
+        // ---- Apply ΔC* via reflection on AerodynamicForces ----
+        final boolean cdApplied = addToDoubleProperty(
+                base, dCd_eff,
                 "setDragCoefficient", "setCD", "setCx", "setAxialForceCoefficient", "setCDAxial"
         );
 
-        boolean cmApplied = (Math.abs(dCm) < 1e-12) ? true : addToDoubleProperty(base,
-                dCm,
-                // the most typical naming for pitch moment coefficient:
+        final boolean cmApplied = (Math.abs(dCm_eff) < 1e-12) ? true : addToDoubleProperty(
+                base, dCm_eff,
                 "setPitchingMomentCoefficient", "setCM", "setCm", "setCMy", "setCmPitch"
         );
 
         if (!cdApplied) {
-            log.debug("[Airbrakes] Could not find a drag-coefficient setter on AerodynamicForces; leaving base unchanged.");
+            log.debug("[Airbrakes] No drag-coefficient setter found on AerodynamicForces; leaving base unchanged.");
         }
         if (!cmApplied) {
-            log.debug("[Airbrakes] Could not find a pitching-moment-coefficient setter on AerodynamicForces; ΔCm skipped.");
+            log.debug("[Airbrakes] No pitching-moment-coefficient setter found; ΔCm skipped.");
         }
 
-        // We mutate 'base' in-place where possible; return it back.
         return base;
     }
+
 
     // ---- lifecycle: end -----------------------------------------------------
     @Override
@@ -268,4 +286,12 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             }
         } catch (Throwable ignore) { /* optional feature */ }
     }
+
+    private static double qRampScale(double q) {
+        // linear ramp 0→1 between Q_RAMP_START_PA and Q_RAMP_FULL_PA
+        if (!(q > 0)) return 0.0;
+        final double t = (q - Q_RAMP_START_PA) / (Q_RAMP_FULL_PA - Q_RAMP_START_PA);
+        return Math.max(0.0, Math.min(1.0, t));
+    }
+
 }

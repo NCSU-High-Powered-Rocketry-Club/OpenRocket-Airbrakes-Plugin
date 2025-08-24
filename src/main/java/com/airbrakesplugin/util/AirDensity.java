@@ -1,44 +1,49 @@
+// src/main/java/com/airbrakesplugin/util/AirDensity.java
 package com.airbrakesplugin.util;
 
-import com.airbrakesplugin.util.CompressibleFlow;
-
 public final class AirDensity {
+    // ISA / gas constants
     private static final double T0 = 288.15;     // K
-    private static final double P0 = 101325.0;   // Pa
-    private static final double L  = 0.0065;     // K/m (troposphere lapse)
+    private static final double P0 = 101_325.0;  // Pa
+    private static final double L  = 0.0065;     // K/m (troposphere lapse rate)
     private static final double R  = 287.05;     // J/(kg·K)
     private static final double g  = 9.80665;    // m/s^2
-    private static final double GAMMA = 1.4;     // air, below ~25 km
+    private static final double GAMMA = 1.4;     // air, up to ~25 km
+
+    // Compressibility handling
     private static final double MACH_COMP_THRESHOLD = 0.30;
 
-    private AirDensity() {}
+    private AirDensity() {} // utility class
 
-    /** ISA temperature (K) – simple two-layer (0–11 km, 11–20 km). */
+    /** ISA temperature (K) – simple two-layer (0–11 km, 11–20 km isothermal). */
     public static double temperatureISA(double h) {
         if (h < 0) h = 0;
-        if (h <= 11000.0) {
+        if (h <= 11_000.0) {
             return T0 - L * h;
         } else {
             // 11–20 km isothermal at T11
-            return T0 - L * 11000.0;
+            return T0 - L * 11_000.0;
         }
     }
 
-    /** ISA pressure (Pa) – simple two-layer (0–11 km, 11–20 km). */
+    /** ISA pressure (Pa) – simple two-layer (0–11 km, 11–20 km isothermal). */
     public static double pressureISA(double h) {
         if (h < 0) h = 0;
-        if (h <= 11000.0) {
+
+        if (h <= 11_000.0) {
             final double T = temperatureISA(h);
+            // Barometric formula with linear lapse: p = P0 * (T/T0)^(g/(L*R))
             return P0 * Math.pow(T / T0, g / (R * L));
         } else {
-            final double T11 = temperatureISA(11000.0);
+            final double T11 = temperatureISA(11_000.0);
             final double P11 = P0 * Math.pow(T11 / T0, g / (R * L));
-            final double H   = h - 11000.0;
+            final double H   = h - 11_000.0;
+            // Isothermal layer: p = P11 * exp(-g*Δh/(R*T11))
             return P11 * Math.exp(-g * H / (R * T11));
         }
     }
 
-    /** ISA density (kg/m^3) from p = ρ R T (static state). */
+    /** ISA density (kg/m^3) via ideal gas law. */
     public static double rhoISA(double h) {
         final double T = temperatureISA(h);
         final double p = pressureISA(h);
@@ -64,32 +69,40 @@ public final class AirDensity {
     }
 
     /**
-     * Compressibility-aware dynamic pressure (Pa).
-     * For M ≤ 0.3 uses ½ ρ V². For M > 0.3 uses qc = Pt − p from isentropic relations.
+     * Compressibility-aware dynamic pressure using velocity (Pa).
+     * For M ≤ 0.3 uses q_inc = ½ ρ V².
+     * For M > 0.3 uses isentropic impact pressure: qc = Pt − p.
      */
     public static double dynamicPressure(double h, double v) {
         final double M = machFromV(v, h);
-        if (M <= MACH_COMP_THRESHOLD) {
-            return dynamicPressureIncompressible(h, v);
+        return dynamicPressureFromMach(h, M, v);
+    }
+
+    /**
+     * Compressibility-aware dynamic pressure when Mach is already known (Pa).
+     * If M ≤ 0.3 returns ½ ρ V² (requires V).
+     * If M > 0.3 returns qc = Pt − p (velocity not needed in that branch).
+     */
+    public static double dynamicPressureFromMach(double h, double mach, double vIfNeeded) {
+        if (!Double.isFinite(mach) || mach <= MACH_COMP_THRESHOLD) {
+            return dynamicPressureIncompressible(h, vIfNeeded);
         }
         final double p = pressureISA(h);
-        return CompressibleFlow.compressibleDynamicPressure(p, M);
+        return CompressibleFlow.compressibleDynamicPressure(p, mach);
     }
 
     /**
      * Effective density ρ_eff for use in q = ½ ρ_eff V².
-     * For M ≤ 0.3, ρ_eff = ρ. For M > 0.3, ρ_eff = ρ * (qc / q_inc),
-     * where qc is compressible dynamic pressure and q_inc = ½ ρ V².
-     *
-     * This lets the rest of your force code keep using q = ½ ρ V²
-     * while still capturing compressibility above M≈0.3.
+     * For M ≤ 0.3, ρ_eff = ρ.
+     * For M > 0.3, ρ_eff = ρ * (qc / q_inc), where
+     *    q_inc = ½ ρ V² and qc = Pt − p from isentropic relations.
      */
     public static double rhoForDynamicPressure(double h, double mach) {
         final double rho = rhoISA(h);
         if (!Double.isFinite(mach) || mach <= MACH_COMP_THRESHOLD) {
             return rho;
         }
-        final double corr = CompressibleFlow.dynamicPressureCorrection(mach);
+        final double corr = CompressibleFlow.dynamicPressureCorrection(mach); // qc / q_inc
         return rho * corr;
     }
 

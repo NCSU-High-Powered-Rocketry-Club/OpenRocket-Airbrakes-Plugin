@@ -23,9 +23,12 @@ public class AirbrakeAerodynamics {
     /**
      * Anything below this threshold is treated as CLOSED (0),
      * anything at/above is treated as FULLY OPEN (1).
-     * Set near 1.0 to only grant "open" when actuator is essentially at its limit.
+     * Keep near 1.0 to only grant "open" when actuator is essentially at its limit.
      */
     private static final double OPEN_THRESHOLD = 0.999;
+
+    /** Tiny offset used to nudge values inside the interpolation domain. */
+    private static final double EPS_FRACTION = 1e-9;
 
     private final BivariateFunction cdFunction;
     private final BivariateFunction cmFunction;
@@ -58,15 +61,17 @@ public class AirbrakeAerodynamics {
         }
     }
 
-    /**
-     * Returns ΔCd at the current Mach, but deployment is coerced to either CLOSED (min deployment in table)
-     * or FULLY OPEN (max deployment in table). Anything below OPEN_THRESHOLD is CLOSED.
-     */
+    // -------------------------------------------------------------------------
+    // Public API (binary endpoints, robust to NaN/out-of-range inputs)
+    // -------------------------------------------------------------------------
+
+    /** Returns ΔCd at the current Mach; deployment coerced to CLOSED or OPEN grid endpoints. */
     public double getIncrementalCd(double mach, double deployFrac) {
         try {
-            final double clampedMach = clamp(mach, machPoints[0], machPoints[machPoints.length - 1]);
-            final double binaryDeploy = pickBinaryDeploymentValue(deployFrac);
-            return cdFunction.value(clampedMach, binaryDeploy);
+            final double mEval = sanitizeMach(mach);
+            final double dEval = pickBinaryDeploymentValue(deployFrac);
+            final double val   = safeEvaluate(cdFunction, mEval, dEval);
+            return Double.isFinite(val) ? val : 0.0;
         } catch (Exception e) {
             LOG.warn("Cd interpolation (binary deploy) failed: mach={}, deployIn={}, error={}",
                     mach, deployFrac, e.getMessage());
@@ -74,15 +79,13 @@ public class AirbrakeAerodynamics {
         }
     }
 
-    /**
-     * Returns ΔCm at the current Mach, but deployment is coerced to either CLOSED (min deployment in table)
-     * or FULLY OPEN (max deployment in table). Anything below OPEN_THRESHOLD is CLOSED.
-     */
+    /** Returns ΔCm at the current Mach; deployment coerced to CLOSED or OPEN grid endpoints. */
     public double getIncrementalCm(double mach, double deployFrac) {
         try {
-            final double clampedMach = clamp(mach, machPoints[0], machPoints[machPoints.length - 1]);
-            final double binaryDeploy = pickBinaryDeploymentValue(deployFrac);
-            return cmFunction.value(clampedMach, binaryDeploy);
+            final double mEval = sanitizeMach(mach);
+            final double dEval = pickBinaryDeploymentValue(deployFrac);
+            final double val   = safeEvaluate(cmFunction, mEval, dEval);
+            return Double.isFinite(val) ? val : 0.0;
         } catch (Exception e) {
             LOG.warn("Cm interpolation (binary deploy) failed: mach={}, deployIn={}, error={}",
                     mach, deployFrac, e.getMessage());
@@ -90,30 +93,88 @@ public class AirbrakeAerodynamics {
         }
     }
 
-    // --- Helpers ----------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
 
     /**
      * Map any deployment fraction to one of the two endpoints in the CFD table:
      * CLOSED -> deploymentPoints[0], OPEN -> deploymentPoints[last].
-     * By default, only values >= OPEN_THRESHOLD are treated as OPEN.
+     * NaN → CLOSED endpoint.
      */
     private double pickBinaryDeploymentValue(double deployFrac) {
-        if (Double.isNaN(deployFrac)) {
-            LOG.debug("NaN deployment received; treating as CLOSED.");
+        if (!Double.isFinite(deployFrac)) {
+            LOG.trace("Deployment {} treated as CLOSED (NaN/non-finite).", deployFrac);
             return deploymentPoints[0];
         }
-
         final boolean open = (deployFrac >= OPEN_THRESHOLD);
         final double chosen = open ? deploymentPoints[deploymentPoints.length - 1] : deploymentPoints[0];
 
-        // Optional: log once in a while when we coerce mid values.
+        // Informative (non-spammy) traces when mid-values are coerced.
         if (!open && deployFrac > 0.0 && deployFrac < OPEN_THRESHOLD) {
-            LOG.trace("Deployment {:.3f} coerced to CLOSED endpoint {:.3f}", deployFrac, chosen);
+            LOG.trace("Deployment {} coerced to CLOSED endpoint {}", String.format("%.3f", deployFrac), String.format("%.3f", chosen));
         } else if (open && deployFrac < 1.0) {
-            LOG.trace("Deployment {:.3f} coerced to OPEN endpoint {:.3f}", deployFrac, chosen);
+            LOG.trace("Deployment {} coerced to OPEN endpoint {}", String.format("%.3f", deployFrac), String.format("%.3f", chosen));
         }
-
         return chosen;
+    }
+
+    /**
+     * Ensure Mach is finite and strictly within the interpolation domain.
+     * NaN/out-of-range → nearest bound, then nudged slightly inside.
+     */
+    private double sanitizeMach(double mach) {
+        final double min = machPoints[0];
+        final double max = machPoints[machPoints.length - 1];
+
+        if (!Double.isFinite(mach)) {
+            // Default to lower bound when NaN; matches your warning line case.
+            final double nudged = nudgeInside(min, min, max);
+            LOG.trace("Mach {} sanitized to {}", mach, nudged);
+            return nudged;
+        }
+        if (mach <= min) return nudgeInside(min, min, max);
+        if (mach >= max) return nudgeInside(max, min, max);
+        return mach;
+    }
+
+    /** Evaluate f(x,y) with a small nudge inside the domain to avoid edge pathologies. */
+    private double safeEvaluate(BivariateFunction f, double mach, double deployValue) {
+        // Deployment value is guaranteed to be one of the exact grid endpoints.
+        // We only ever nudge Mach (x), not deployment (y), to preserve binary behavior.
+        final double min = machPoints[0];
+        final double max = machPoints[machPoints.length - 1];
+
+        // Try at the given mach; if it fails or returns NaN, try tiny nudges inward.
+        double x = mach;
+        for (int i = 0; i < 3; i++) {
+            try {
+                double val = f.value(x, deployValue);
+                if (Double.isFinite(val)) return val;
+            } catch (Exception ignore) {
+                // fall through to nudge
+            }
+            // Nudge inward proportionally to domain width
+            x = nudgeInside(x, min, max);
+        }
+        // Give up gracefully
+        LOG.debug("Interpolation failed at mach={} (sanitized from {}), deploy={}; returning 0",
+                x, mach, deployValue);
+        return 0.0;
+    }
+
+    /** Returns a value strictly inside (min,max), or at boundaries slightly offset inward. */
+    private double nudgeInside(double x, double min, double max) {
+        final double w = Math.max(1.0, Math.abs(max - min));
+        final double eps = EPS_FRACTION * w;
+
+        if (x <= min) return Math.min(min + eps, max - eps);
+        if (x >= max) return Math.max(max - eps, min + eps);
+        // already inside: pull slightly away from the closest bound
+        final double dMin = Math.abs(x - min);
+        final double dMax = Math.abs(max - x);
+        if (dMin < dMax) return Math.min(x + eps, max - eps);
+        return Math.max(x - eps, min + eps);
     }
 
     private List<AirbrakeDataPoint> loadCFDData(String csvFilePath) throws IOException {
@@ -223,6 +284,8 @@ public class AirbrakeAerodynamics {
                 .orElse(null);
     }
 
+    // --- unused at the moment, but handy ------------------------------------
+    @SuppressWarnings("unused")
     private static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
     }
