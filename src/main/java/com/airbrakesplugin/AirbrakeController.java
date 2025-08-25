@@ -88,13 +88,13 @@ public final class AirbrakeController {
         // ── Thrust gating: don't make *new* decisions during powered phase ─
         final boolean thrusting = isThrusting(status);
         // We still output the *latched* command, but avoid switching while thrusting.
-        final double tol_m = config.getApogeeToleranceMeters().orElse(5.0);
+        final double tol_m = config.getApogeeToleranceMeters();
         final double target = finiteOr(config.getTargetApogee(), 0.0);
 
         // ── Predict apogee (coast-aware, gravity-subtracted) ───────────────
         // Prefer a simple ballistic rise under effective decel (g + a_drag),
         // where a_drag = max(0, -(az + g)). If az is NaN, assume no drag.
-        final double g = 9.80665;
+        final double g = status.getFlightDataBranch().getLast(FlightDataType.TYPE_GRAVITY);
         double a_drag = 0.0;
         if (Double.isFinite(az_mps2)) {
             a_drag = Math.max(0.0, -(az_mps2 + g));   // remove gravity; count only drag decel

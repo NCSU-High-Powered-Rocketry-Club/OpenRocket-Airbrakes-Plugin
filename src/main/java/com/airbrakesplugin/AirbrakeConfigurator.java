@@ -95,6 +95,13 @@ public class AirbrakeConfigurator
         maxMachSpinner.setEditor(new SpinnerEditor(maxMachSpinner));
         panel.add(maxMachSpinner, "wrap");
 
+       panel.add(new JLabel("Apogee tolerance (±):"));
+        final DoubleModel tolDoubleModel = new DoubleModel(ext, "ApogeeToleranceMeters", UnitGroup.UNITS_DISTANCE, 0);
+        final JSpinner tolSpinner = new JSpinner(tolDoubleModel.getSpinnerModel());
+        tolSpinner.setEditor(new SpinnerEditor(tolSpinner));
+        panel.add(tolSpinner);
+        panel.add(new UnitSelector(tolDoubleModel), "wrap");
+
         return panel;
     }
 }

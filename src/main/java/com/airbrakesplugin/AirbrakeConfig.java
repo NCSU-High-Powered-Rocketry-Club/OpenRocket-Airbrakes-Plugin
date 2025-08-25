@@ -38,15 +38,16 @@ public class AirbrakeConfig {
      * Constructor with default values.
      */
     public AirbrakeConfig() {
-        this.referenceArea = 0.008706;            // m²
-        this.referenceLength = 0.1016;          // m
+        this.referenceArea = 0.0;            // m²
+        this.referenceLength = 0.0;          // m
         this.maxDeploymentRate = 4.0;        // 1/s (fraction per second)
-        this.targetApogee = 540.0;           // m AGL
-        this.deployAltitudeThreshold = 1;   // m AGL – prevent ground tests
-        this.maxMachForDeployment = 4;     // cap for supersonic
+        this.targetApogee = 0.0;           // m AGL
+        this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
+        this.maxMachForDeployment = 1.0;     // cap for supersonic
         this.alwaysOpenMode = false;
-        this.alwaysOpenPercentage = 1.0;       // 0–1
+        this.alwaysOpenPercentage = 1;       // 0–1
         this.apogeeToleranceMeters = null;
+        this.apogeeToleranceMeters = 5.0;     // default tolerance
     }
 
     // =====================================================================
@@ -82,8 +83,8 @@ public class AirbrakeConfig {
     public void    setAlwaysOpenPercentage(double pct){ this.alwaysOpenPercentage = clamp01(pct); }
 
     /** Optional tolerance accessor (controller calls via reflection). */
-    public Optional<Double> getApogeeToleranceMeters(){ return Optional.ofNullable(apogeeToleranceMeters); }
-    public void setApogeeToleranceMeters(Double tol) { this.apogeeToleranceMeters = tol; }
+    public double getApogeeToleranceMeters() { return apogeeToleranceMeters; }
+    public void setApogeeToleranceMeters(double tol) { this.apogeeToleranceMeters = tol; }
 
     // =====================================================================
     private static double clamp01(double v) { return Math.max(0.0, Math.min(1.0, v)); }
