@@ -199,8 +199,7 @@ public class AirbrakeAerodynamics {
                     double cmIncr = Double.parseDouble(record.get("Cm_increment"));
                     dataPoints.add(new AirbrakeDataPoint(mach, deploy, cdIncr, cmIncr));
                 } catch (Exception e) {
-                    LOG.warn("Skipping malformed CSV record {}: {}",
-                            record.getRecordNumber(), e.getMessage());
+                    LOG.warn("Skipping malformed CSV record {}: {}", record.getRecordNumber(), e.getMessage());
                 }
             }
         }
@@ -235,8 +234,7 @@ public class AirbrakeAerodynamics {
         }
     }
 
-    private double[] extractDistinctSortedValues(List<AirbrakeDataPoint> dataPoints,
-                                                 java.util.function.Function<AirbrakeDataPoint, Double> valueExtractor) {
+    private double[] extractDistinctSortedValues(List<AirbrakeDataPoint> dataPoints, java.util.function.Function<AirbrakeDataPoint, Double> valueExtractor) {
         return dataPoints.stream()
                 .map(valueExtractor)
                 .distinct()

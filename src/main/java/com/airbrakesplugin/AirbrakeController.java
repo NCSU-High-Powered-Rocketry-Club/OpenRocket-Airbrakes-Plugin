@@ -6,8 +6,6 @@ import org.slf4j.LoggerFactory;
 import info.openrocket.core.simulation.FlightDataType;
 import info.openrocket.core.simulation.SimulationStatus;
 
-import java.util.Optional;
-
 /**
  * AirbrakeController
  * Bang-bang controller with dwell (anti-chatter) for binary aerodynamics.
@@ -63,13 +61,7 @@ public final class AirbrakeController {
      * @param dt_s     simulation step [s]
      * @param status   SimulationStatus (for time & optional thrust/mach/apogee reads)
      */
-    public double getCommandedDeployment(final double alt_m,
-                                         final double vz_mps,
-                                         final double az_mps2,
-                                         final double mach,
-                                         final double deploy,
-                                         final double dt_s,
-                                         final SimulationStatus status) {
+    public double getCommandedDeployment(final double alt_m, final double vz_mps, final double az_mps2, final double mach, final double deploy, final double dt_s, final SimulationStatus status) {
         final double t = (status != null) ? finiteOr(status.getSimulationTime(), lastTime_s + dt_s) : (lastTime_s + dt_s);
         lastTime_s = t;
 

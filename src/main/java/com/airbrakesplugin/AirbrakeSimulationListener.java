@@ -127,8 +127,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     // ---- single-point coefficient injection (Waterloo pattern) -------------
     @Override
-    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
-                                                        final AerodynamicForces base) throws SimulationException {
+    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status, final AerodynamicForces base) throws SimulationException {
         if (aerodynamics == null || base == null || status == null) return base;
 
         final double deployFrac = clamp01(this.deploy);
@@ -179,10 +178,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
                 "setDragCoefficient", "setCD", "setCx", "setAxialForceCoefficient", "setCDAxial"
         );
 
-        final boolean cmApplied = (Math.abs(dCm_eff) < 1e-12) ? true : addToDoubleProperty(
-                base, dCm_eff,
-                "setPitchingMomentCoefficient", "setCM", "setCm", "setCMy", "setCmPitch"
-        );
+        final boolean cmApplied = (Math.abs(dCm_eff) < 1e-12) ? true : addToDoubleProperty(base, dCm_eff,"setPitchingMomentCoefficient", "setCM", "setCm", "setCMy", "setCmPitch");
 
         if (!cdApplied) {
             log.debug("[Airbrakes] No drag-coefficient setter found on AerodynamicForces; leaving base unchanged.");
