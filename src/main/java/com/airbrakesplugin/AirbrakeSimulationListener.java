@@ -3,6 +3,8 @@ package com.airbrakesplugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.airbrakesplugin.util.AirDensity;
+
 import info.openrocket.core.aerodynamics.AerodynamicForces;
 import info.openrocket.core.rocketcomponent.Rocket;
 import info.openrocket.core.simulation.FlightDataType;
@@ -17,9 +19,11 @@ import java.util.Objects;
 /**
  * AirbrakeSimulationListener — coefficient-only injection (Waterloo structure)
  *
- * - preStep(): evolve actuator (rate-limited)
- * - postProcessAerodynamicForces(): add ΔCd (and optional ΔCm) to "base" via reflection
- * - keeps AirDensity.rhoForDynamicPressure(alt, Mach)
+ * - Uses ApogeePredictorListener to estimate apogee (axis accel w/ gravity subtracted)
+ * - Uses bang-bang AirbrakeController to set commanded endstate (extend / retract)
+ * - preStep(): feed predictor, run controller, rate-limit actuator toward commandedDeploy
+ * - postAerodynamicCalculation(): add ΔCd (and optional ΔCm) via reflection
+ * - Keeps custom dynamic pressure path via AirDensity (compressibility-aware)
  */
 public final class AirbrakeSimulationListener extends AbstractSimulationListener {
 
@@ -31,28 +35,30 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private SimulationStatus sim;
 
     // ---- subsystems ----------------------------------------------------------
-    private AirbrakeAerodynamics aerodynamics;  // ΔCd(M, deploy), optional ΔCm
-    private AirbrakeController   controller;    // commanded deployment [0..1]
+    private AirbrakeAerodynamics aerodynamics;     // ΔCd(M, deploy), optional ΔCm
+    private com.airbrakesplugin.util.ApogeePredictorListener predictor;     // live OR-driven apogee predictor
+    private AirbrakeController   controller;       // bang-bang controller
 
     // ---- geometry & limits (SI) ---------------------------------------------
-    private double Sref = 0.008706;  // m^2, default to 8706 mm^2
-    private double Lref = 0.1016;    // m,   default to 4 in
-    private double maxRate = 1.0;    // fraction/s
+    private double Sref = 0.0;             // m²
+    private double Lref = 0.0;             // m
+    private double maxRate = 4.0;          // fraction/s (actuator slew)
 
     // ---- state ---------------------------------------------------------------
     private double lastTime_s = 0.0;
-    private double deploy     = 0.0;   // physical actuator state [0..1]
+    private double deploy     = 0.0;       // physical actuator state [0..1]
+    private double commandedDeploy = 0.0;  // controller desired endstate (0 or 1)
     private double currentAirbrakeDeployment = 0.0;
 
-// Add near top of the class with other constants:
+    // ---- Q-ramp to avoid low-q blowups --------------------------------------
     private static final double Q_RAMP_START_PA = 5.0;   // start applying effect ~5 Pa
     private static final double Q_RAMP_FULL_PA  = 50.0;  // full effect by ~50 Pa
     private static final double EPS_Q           = 1e-6;
 
-
     public AirbrakeSimulationListener(final AirbrakeConfig cfg, final Rocket rkt) {
         this.config = Objects.requireNonNull(cfg, "AirbrakeConfig must not be null");
         this.rocket = rkt;
+        log.debug("[Airbrakes] Listener created with config: {}", cfg);
     }
 
     public double getCurrentAirbrakeDeployment() { return currentAirbrakeDeployment; }
@@ -62,62 +68,107 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     @Override
     public void startSimulation(final SimulationStatus status) throws SimulationException {
         this.sim = status;
-        try { this.rocket = (Rocket) status.getClass().getMethod("getRocket").invoke(status); }
-        catch (Throwable ignore) { /* ok */ }
+        log.debug("[Airbrakes] Simulation starting...");
+        try { 
+            this.rocket = (Rocket) status.getClass().getMethod("getRocket").invoke(status); 
+            log.debug("[Airbrakes] Retrieved rocket reference from simulation status");
+        }
+        catch (Throwable ignore) { 
+            log.debug("[Airbrakes] Could not retrieve rocket from simulation status"); 
+        }
 
         // Load aero tables
         try {
+            log.debug("[Airbrakes] Loading aerodynamics data from: {}", config.getCfdDataFilePath());
             this.aerodynamics = new AirbrakeAerodynamics(config.getCfdDataFilePath());
+            log.debug("[Airbrakes] Aerodynamics data loaded successfully");
         } catch (Exception e) {
             log.error("Failed to load airbrake CFD data from {}: {}", config.getCfdDataFilePath(), e.toString());
             throw new SimulationException("Airbrake CFD data failed to load", e);
         }
 
-        // Controller
-        this.controller = new AirbrakeController(config);
-        this.controller.setContext(new AirbrakeController.ControlContext() {
-            @Override public void extend_airbrakes() {/* no-op */}
-            @Override public void retract_airbrakes() {/* no-op */}
-            @Override public void switch_altitude_back_to_pressure() {/* no-op */}
+        // Predictor: uses OpenRocket sim data; subtracts gravity; aligns along rocket axis
+        log.debug("[Airbrakes] Initializing apogee predictor");
+        this.predictor = new com.airbrakesplugin.util.ApogeePredictorListener();
+
+        // Controller: simple bang-bang using predictor apogee
+        double target = safeTargetApogee(config);
+        this.commandedDeploy = 0.0; // start closed
+        log.debug("[Airbrakes] Initializing controller with target apogee: {} m", target);
+        this.controller = new AirbrakeController(target, predictor, new AirbrakeController.ControlContext() {
+            @Override public void extend_airbrakes() { 
+                commandedDeploy = 1.0; 
+                log.debug("[Airbrakes] Controller commanding EXTEND");
+            }
+            @Override public void retract_airbrakes() { 
+                commandedDeploy = 0.0; 
+                log.debug("[Airbrakes] Controller commanding RETRACT");
+            }
+            @Override public void switch_altitude_back_to_pressure() { 
+                log.debug("[Airbrakes] Controller switching altitude back to pressure (no-op)");
+            }
         });
 
         // Config overrides (safe defaults already set above)
-        if (config.getReferenceArea()   > 0) Sref = config.getReferenceArea();
-        if (config.getReferenceLength() > 0) Lref = config.getReferenceLength();
-        if (config.getMaxDeploymentRate() > 0) maxRate = config.getMaxDeploymentRate();
+        Sref   = config.getReferenceArea();
+        Lref   = config.getReferenceLength();
+        maxRate = config.getMaxDeploymentRate();
 
         deploy     = 0.0;
         lastTime_s = finiteOr(status.getSimulationTime(), 0.0);
 
-        log.info("[Airbrakes] init: Sref={} m^2, Lref={} m, maxRate={} frac/s", Sref, Lref, maxRate);
+        log.info("[Airbrakes] init: Sref={} m^2, Lref={} m, maxRate={} frac/s, target={} m",
+                Sref, Lref, maxRate, target);
     }
 
-    // ---- lifecycle: step state update (actuator only) -----------------------
+    // ---- lifecycle: step state update (predictor, controller, actuator) -----
     @Override
     public boolean preStep(final SimulationStatus status) {
-        if (aerodynamics == null || controller == null) return true;
+        if (aerodynamics == null || controller == null || predictor == null) {
+            log.debug("[Airbrakes] preStep: skipping due to uninitialized components");
+            return true;
+        }
 
         final double t  = finiteOr(status.getSimulationTime(), lastTime_s);
         final double dt = Math.max(0.0, t - lastTime_s);
         lastTime_s = t;
         if (dt <= 0.0) return true;
 
-        // Inputs for controller
-        final double alt  = safeGet(status, FlightDataType.TYPE_ALTITUDE,    0.0);
-        final double mach = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, 0.0);
-        final Coordinate v = status.getRocketVelocity();
-        final double vz    = (v != null && Double.isFinite(v.z)) ? v.z : 0.0;
-
-        double az = Double.NaN;
+        // 1) Feed predictor with the live sim step (it reads V, orientation, altitude, etc.)
         try {
-            final double accZ = status.getFlightDataBranch().getLast(FlightDataType.TYPE_ACCELERATION_Z);
-            if (Double.isFinite(accZ)) az = accZ;
-        } catch (Throwable ignore) { /* ok */ }
+            log.debug("[Airbrakes] t={}: Updating predictor", t);
+            predictor.postStep(status); // safe: we call it explicitly to keep everything in one listener
+            double predictedApogee = predictor.getLatestPredictedApogee();
+            log.debug("[Airbrakes] Predicted apogee: {} m", predictedApogee);
+        } catch (Throwable ex) {
+            // predictor is best-effort; don't fail the sim if something goes wrong
+            log.debug("[Airbrakes] predictor.postStep error: {}", ex.toString());
+        }
 
-        // Command & rate limit
-        final double u_cmd = controller.getCommandedDeployment(alt, vz, az, mach, deploy, dt, status);
-        final double dmax  = maxRate * dt;
-        deploy = clamp01(clamp(u_cmd, deploy - dmax, deploy + dmax));
+        // 2) Run controller (bang-bang on predicted apogee)
+        try {
+            log.debug("[Airbrakes] t={}: Running controller", t);
+            double oldCommand = commandedDeploy;
+            controller.update(status);
+            if (oldCommand != commandedDeploy) {
+                log.info("[Airbrakes] t={}: Controller changed command from {} to {}", 
+                        t, oldCommand, commandedDeploy);
+            }
+        } catch (Throwable ex) {
+            log.debug("[Airbrakes] controller.update error: {}", ex.toString());
+        }
+
+        // 3) Evolve physical actuator toward commanded endstate at maxRate
+        final double dmax  = maxRate * dt;        // max change this step
+        final double lo    = Math.max(0.0, commandedDeploy - dmax);
+        final double hi    = Math.min(1.0, commandedDeploy + dmax);
+        double oldDeploy = deploy;
+        deploy = clamp01(clamp(deploy, lo, hi));
+        
+        if (Math.abs(deploy - oldDeploy) > 0.001) {
+            log.debug("[Airbrakes] t={}: Deployment changed from {:.4f} to {:.4f} (commanded: {}, dmax: {:.4f})",
+                    t, oldDeploy, deploy, commandedDeploy, dmax);
+        }
 
         currentAirbrakeDeployment = deploy;
         tryEmitExtensionToFlightData(status, deploy);
@@ -128,57 +179,91 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     // ---- single-point coefficient injection (Waterloo pattern) -------------
     @Override
     public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status, final AerodynamicForces base) throws SimulationException {
-        if (aerodynamics == null || base == null || status == null) return base;
+        if (aerodynamics == null || base == null || status == null) {
+            log.debug("[Airbrakes] postAerodynamicCalculation: skipping due to null components");
+            return base;
+        }
 
         final double deployFrac = clamp01(this.deploy);
         if (deployFrac <= 1e-6) return base;
 
+        final double t = status.getSimulationTime();
+        
         // Velocity magnitude
         final Coordinate vel = status.getRocketVelocity();
         final double V = (vel != null) ? vel.length() : 0.0;
-        if (!(V > 0.1)) return base; // avoid near-zero noise
-
-        // Altitude & Mach
-        final double alt = safeGet(status, FlightDataType.TYPE_ALTITUDE, 0.0);
-        double mach = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, Double.NaN);
-        if (!Double.isFinite(mach) || mach <= 0) {
-            // Fallback: compute Mach from V & altitude using your AirDensity
-            mach = com.airbrakesplugin.util.AirDensity.machFromV(V, alt);
+        if (!(V > 0.1)) {
+            log.debug("[Airbrakes] t={}: Skipping aero calcs due to near-zero velocity ({} m/s)", t, V);
+            return base; // avoid near-zero noise
         }
 
-        // Dynamic pressure (compressibility-aware). Uses qc = Pt - p for M > 0.3, else ½ρV².
-        final double q = com.airbrakesplugin.util.AirDensity.dynamicPressureFromMach(alt, mach, V);
-        if (!(q > EPS_Q)) return base;
+        // Altitude & Mach (compute Mach from local a(alt) if needed)
+        final double alt = safeGet(status, FlightDataType.TYPE_ALTITUDE, 0.0);
 
-        // Δcoeffs from tables (binary deploy handled inside AirbrakeAerodynamics)
+        double mach = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, Double.NaN);
+        if (!Double.isFinite(mach) || mach <= 0) {
+            try {
+                final double a = AirDensity.speedOfSoundISA(alt);
+                if (a > 1e-6) mach = V / a;
+                log.debug("[Airbrakes] t={}: Calculated Mach from V/a: {:.3f}", t, mach);
+            } catch (Throwable ignore) { /* fallback below */ }
+        }
+        if (!Double.isFinite(mach) || mach <= 0) {
+            try { 
+                mach = AirDensity.machFromV(V, alt); 
+                log.debug("[Airbrakes] t={}: Used utility to calculate Mach: {:.3f}", t, mach);
+            }
+            catch (Throwable ignore) { mach = 0.0; }
+        }
+
+        // Dynamic pressure (compressibility-aware via effective density)
+        final double rhoEff = AirDensity.rhoForDynamicPressure(alt, mach); // includes qc/q_inc above M~0.3
+        final double q = 0.5 * rhoEff * V * V;
+        if (!(q > EPS_Q)) {
+            log.debug("[Airbrakes] t={}: Skipping aero calcs due to insufficient dynamic pressure ({} Pa)", t, q);
+            return base;
+        }
+
+        // Δcoeffs from tables (binary deploy handled inside AirbrakeAerodynamics if you made it so)
         double dCd_tab = aerodynamics.getIncrementalCd(mach, deployFrac);
-        if (!Double.isFinite(dCd_tab) || Math.abs(dCd_tab) < 1e-12) return base;
+        if (!Double.isFinite(dCd_tab) || Math.abs(dCd_tab) < 1e-12) {
+            log.debug("[Airbrakes] t={}: Invalid or negligible ΔCd={} from tables", t, dCd_tab);
+            return base;
+        }
 
         double dCm_tab = 0.0;
         try {
             final double tmp = aerodynamics.getIncrementalCm(mach, deployFrac);
             if (Double.isFinite(tmp)) dCm_tab = tmp;
-        } catch (Throwable ignore) { /* leave zero */ }
+            log.debug("[Airbrakes] t={}: Retrieved ΔCm={} from tables", t, dCm_tab);
+        } catch (Throwable ignore) { 
+            log.debug("[Airbrakes] t={}: No ΔCm available, using 0", t);
+        }
 
         // --- Force domain (apply ramp vs. very low-q) ---
         final double ramp = qRampScale(q);                 // 0..1
         final double dF   = ramp * (q * Sref * dCd_tab);   // N
         final double dM   = ramp * (q * Sref * Lref * dCm_tab); // N·m
 
+        log.debug("[Airbrakes] t={}: alt={:.1f}m, V={:.1f}m/s, M={:.2f}, q={:.1f}Pa, deploy={:.2f}, ramp={:.2f}, dF={:.3f}N, dM={:.3f}Nm",
+                t, alt, V, mach, q, deployFrac, ramp, dF, dM);
+
         // --- Back to coefficients for OR update ---
-        final double inv_qS  = (q > EPS_Q && Sref > 0.0) ? (1.0 / (q * Sref)) : 0.0;
-        final double inv_qSL = (q > EPS_Q && Sref > 0.0 && Lref > 0.0) ? (1.0 / (q * Sref * Lref)) : 0.0;
+        final double inv_qS  = 1.0 / (q * Sref);
+        final double inv_qSL = 1.0 / (q * Sref * Lref);
 
         final double dCd_eff = dF * inv_qS;     // == ramp * dCd_tab when valid
         final double dCm_eff = dM * inv_qSL;    // == ramp * dCm_tab when valid
 
-        // ---- Apply ΔC* via reflection on AerodynamicForces ----
-        final boolean cdApplied = addToDoubleProperty(
-                base, dCd_eff,
-                "setDragCoefficient", "setCD", "setCx", "setAxialForceCoefficient", "setCDAxial"
-        );
+        log.debug("[Airbrakes] t={}: Applying effective ΔCd={:.4f}, ΔCm={:.4f}", t, dCd_eff, dCm_eff);
 
-        final boolean cmApplied = (Math.abs(dCm_eff) < 1e-12) ? true : addToDoubleProperty(base, dCm_eff,"setPitchingMomentCoefficient", "setCM", "setCm", "setCMy", "setCmPitch");
+        // ---- Apply ΔC* via reflection on AerodynamicForces ----
+        final boolean cdApplied = addToDoubleProperty(base, dCd_eff,
+                "setDragCoefficient", "setCD", "setCx", "setAxialForceCoefficient", "setCDAxial");
+
+        final boolean cmApplied = (Math.abs(dCm_eff) < 1e-12) ? true :
+                addToDoubleProperty(base, dCm_eff,
+                        "setPitchingMomentCoefficient", "setCM", "setCm", "setCMy", "setCmPitch");
 
         if (!cdApplied) {
             log.debug("[Airbrakes] No drag-coefficient setter found on AerodynamicForces; leaving base unchanged.");
@@ -190,12 +275,22 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         return base;
     }
 
-
     // ---- lifecycle: end -----------------------------------------------------
     @Override
     public void endSimulation(final SimulationStatus status, final SimulationException e) {
-        if (e != null) log.error("[Airbrakes] Simulation ended with error", e);
-        else           log.info("[Airbrakes] Simulation complete – final deploy={}", deploy);
+        if (e != null) {
+            log.error("[Airbrakes] Simulation ended with error", e);
+        } else {
+            log.info("[Airbrakes] Simulation complete – final deploy={}, commanded={}", deploy, commandedDeploy);
+            
+            // Additional debugging info at sim end
+            if (predictor != null) {
+                log.info("[Airbrakes] Final predicted apogee: {} m", predictor.getLatestPredictedApogee());
+            }
+            
+            double altitude = safeGet(status, FlightDataType.TYPE_ALTITUDE, -1);
+            log.info("[Airbrakes] Final altitude: {} m", altitude);
+        }
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -212,20 +307,39 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
     }
 
+    private static double safeTargetApogee(AirbrakeConfig cfg) {
+        try {
+            // Prefer a dedicated getter if present
+            Method m = cfg.getClass().getMethod("getTargetApogee");
+            Object v = m.invoke(cfg);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        } catch (Throwable ignore) { /* fall through */ }
+        // Fallback to 0 if not configured
+        return 0.0;
+    }
+
     /**
-     * Adds delta to a double property on 'obj' using common getter/setter spellings.
+     * Adds delta to a double property on 'obj' using common setter spellings.
      * Returns true if applied.
      */
-    private static boolean addToDoubleProperty(final Object obj, final double delta, final String... setterCandidates) {
-        if (Math.abs(delta) < 1e-15) return true;
-        // Try to find a paired getter for read-modify-write. If none, try "addXxx(double)" style.
-        // 1) Look for any getter that returns double and has "get.*Coeff" or short names (CD, CM, Cx...)
+    private static boolean addToDoubleProperty(final Object obj, final double value, final String... setterCandidates) {
+        if (!Double.isFinite(value)) return true;
+        // Try any direct setter first.
+        for (String name : setterCandidates) {
+            try {
+                Method m = obj.getClass().getMethod(name, double.class);
+                m.invoke(obj, value);
+                return true;
+            } catch (NoSuchMethodException ignored) { /* try next */ }
+            catch (Throwable t) { /* try next */ }
+        }
+        // Fallback: read-modify-write if a getter exists (rare with OR internals)
         Double current = tryGetAnyDouble(obj,
                 "getDragCoefficient", "getCD", "getCx", "getAxialForceCoefficient", "getCDAxial",
                 "getPitchingMomentCoefficient", "getCM", "getCm", "getCMy", "getCmPitch"
         );
         if (current != null) {
-            final double updated = current + delta;
+            double updated = current + value;
             for (String name : setterCandidates) {
                 try {
                     Method m = obj.getClass().getMethod(name, double.class);
@@ -235,16 +349,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
                 catch (Throwable t) { /* try next */ }
             }
         }
-        // 2) Try direct adder (e.g., addDragCoefficient(double))
-        for (String set : setterCandidates) {
-            final String addName = set.replaceFirst("^set", "add");
-            try {
-                Method m = obj.getClass().getMethod(addName, double.class);
-                m.invoke(obj, delta);
-                return true;
-            } catch (NoSuchMethodException ignored) { /* try next */ }
-            catch (Throwable t) { /* try next */ }
-        }
         return false;
     }
 
@@ -252,14 +356,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         for (String g : getters) {
             try {
                 Method m = obj.getClass().getMethod(g);
-                if (m.getReturnType() == double.class || m.getReturnType() == Double.TYPE) {
-                    Object v = m.invoke(obj);
-                    if (v instanceof Double) return (Double) v;
-                    if (v != null && v.getClass() == double.class) return (Double) v;
-                    if (v == null) continue;
-                    // handle primitive double via reflection boxing
-                    return ((Number) v).doubleValue();
-                }
+                Object v = m.invoke(obj);
+                if (v instanceof Number) return ((Number) v).doubleValue();
             } catch (NoSuchMethodException ignored) { /* try next */ }
             catch (Throwable t) { /* try next */ }
         }
@@ -267,8 +365,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     }
 
     /**
-     * Best-effort: write a user-visible “Airbrake Extension (%)”.
-     * On some OR versions there’s no API for dynamic columns; this silently no-ops.
+     * Best-effort: write a user-visible "Airbrake Extension (%)".
+     * On some OR versions there's no API for dynamic columns; this silently no-ops.
      */
     private static void tryEmitExtensionToFlightData(final SimulationStatus st, final double deployFrac) {
         try {
@@ -289,5 +387,4 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double t = (q - Q_RAMP_START_PA) / (Q_RAMP_FULL_PA - Q_RAMP_START_PA);
         return Math.max(0.0, Math.min(1.0, t));
     }
-
 }
