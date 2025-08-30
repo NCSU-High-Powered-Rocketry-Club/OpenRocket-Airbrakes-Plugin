@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.airbrakesplugin.util.AirDensity;
+import com.airbrakesplugin.util.ApogeePredictor;
 
 import info.openrocket.core.aerodynamics.AerodynamicForces;
 import info.openrocket.core.rocketcomponent.Rocket;
@@ -12,6 +13,7 @@ import info.openrocket.core.simulation.SimulationStatus;
 import info.openrocket.core.simulation.exception.SimulationException;
 import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
 import info.openrocket.core.util.Coordinate;
+import info.openrocket.core.util.Quaternion;
 
 import java.lang.reflect.Method;
 import java.util.Objects;
@@ -19,11 +21,10 @@ import java.util.Objects;
 /**
  * AirbrakeSimulationListener — coefficient-only injection (Waterloo structure)
  *
- * - Uses ApogeePredictorListener to estimate apogee (axis accel w/ gravity subtracted)
- * - Uses bang-bang AirbrakeController to set commanded endstate (extend / retract)
- * - preStep(): feed predictor, run controller, rate-limit actuator toward commandedDeploy
- * - postAerodynamicCalculation(): add ΔCd (and optional ΔCm) via reflection
- * - Keeps custom dynamic pressure path via AirDensity (compressibility-aware)
+ * Python-parity wiring:
+ *  - Compute vertical accel INCLUDING g via dv/dt on WORLD_Z; call predictor.update(...) ONLY during coast.
+ *  - The predictor subtracts g internally in LUT building (parity with Python).
+ *  - Controller reads predictor.getPredictionIfReady() for bang-bang.
  */
 public final class AirbrakeSimulationListener extends AbstractSimulationListener {
 
@@ -36,7 +37,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     // ---- subsystems ----------------------------------------------------------
     private AirbrakeAerodynamics aerodynamics;     // ΔCd(M, deploy), optional ΔCm
-    private com.airbrakesplugin.util.ApogeePredictorListener predictor;     // live OR-driven apogee predictor
+    private ApogeePredictor      predictor;        // Python-parity predictor (no internal gating)
     private AirbrakeController   controller;       // bang-bang controller
 
     // ---- geometry & limits (SI) ---------------------------------------------
@@ -47,8 +48,22 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     // ---- state ---------------------------------------------------------------
     private double lastTime_s = 0.0;
     private double deploy     = 0.0;       // physical actuator state [0..1]
-    private double commandedDeploy = 0.0;  // controller desired endstate (0 or 1)
+    private double commandedDeploy = 0.0;  // controller desired end-state (0 or 1)
     private double currentAirbrakeDeployment = 0.0;
+
+    // Tracking for accel computation & coast gating
+    private Double lastVaxis = null;
+    private boolean coastLatched = false;
+    private int thrustZeroHits = 0;
+    private int accelGateHits  = 0;
+
+    // ---- coast detection thresholds -----------------------------------------
+    private static final double G = 9.80665;
+    private static final double THRUST_EPSILON_N     = 1.0; // thrust≈0 gate
+    private static final int    THRUST_CONSEC_HITS   = 2;
+    private static final double ACCEL_MINUS_G_THRESH = 1.5; // m/s^2, small decel gate
+    private static final int    ACCEL_CONSEC_HITS    = 2;
+    private static final double COAST_TIME_FALLBACKS = 1.0; // s
 
     // ---- Q-ramp to avoid low-q blowups --------------------------------------
     private static final double Q_RAMP_START_PA = 5.0;   // start applying effect ~5 Pa
@@ -69,12 +84,11 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     public void startSimulation(final SimulationStatus status) throws SimulationException {
         this.sim = status;
         log.debug("[Airbrakes] Simulation starting...");
-        try { 
-            this.rocket = (Rocket) status.getClass().getMethod("getRocket").invoke(status); 
+        try {
+            this.rocket = (Rocket) status.getClass().getMethod("getRocket").invoke(status);
             log.debug("[Airbrakes] Retrieved rocket reference from simulation status");
-        }
-        catch (Throwable ignore) { 
-            log.debug("[Airbrakes] Could not retrieve rocket from simulation status"); 
+        } catch (Throwable ignore) {
+            log.debug("[Airbrakes] Could not retrieve rocket from simulation status");
         }
 
         // Load aero tables
@@ -87,35 +101,30 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             throw new SimulationException("Airbrake CFD data failed to load", e);
         }
 
-        // Predictor: uses OpenRocket sim data; subtracts gravity; aligns along rocket axis
-        log.debug("[Airbrakes] Initializing apogee predictor");
-        this.predictor = new com.airbrakesplugin.util.ApogeePredictorListener();
+        // Predictor
+        this.predictor = ApogeePredictor.defaultConfig();
 
-        // Controller: simple bang-bang using predictor apogee
+        // Controller
         double target = safeTargetApogee(config);
         this.commandedDeploy = 0.0; // start closed
         log.debug("[Airbrakes] Initializing controller with target apogee: {} m", target);
         this.controller = new AirbrakeController(target, predictor, new AirbrakeController.ControlContext() {
-            @Override public void extend_airbrakes() { 
-                commandedDeploy = 1.0; 
-                log.debug("[Airbrakes] Controller commanding EXTEND");
-            }
-            @Override public void retract_airbrakes() { 
-                commandedDeploy = 0.0; 
-                log.debug("[Airbrakes] Controller commanding RETRACT");
-            }
-            @Override public void switch_altitude_back_to_pressure() { 
-                log.debug("[Airbrakes] Controller switching altitude back to pressure (no-op)");
-            }
+            @Override public void extend_airbrakes() { commandedDeploy = 1.0; log.debug("[Airbrakes] EXTEND"); }
+            @Override public void retract_airbrakes() { commandedDeploy = 0.0; log.debug("[Airbrakes] RETRACT"); }
+            @Override public void switch_altitude_back_to_pressure() { /* no-op */ }
         });
 
-        // Config overrides (safe defaults already set above)
+        // Config overrides
         Sref   = config.getReferenceArea();
         Lref   = config.getReferenceLength();
         maxRate = config.getMaxDeploymentRate();
 
         deploy     = 0.0;
         lastTime_s = finiteOr(status.getSimulationTime(), 0.0);
+        lastVaxis  = null;
+        coastLatched = false;
+        thrustZeroHits = 0;
+        accelGateHits  = 0;
 
         log.info("[Airbrakes] init: Sref={} m^2, Lref={} m, maxRate={} frac/s, target={} m",
                 Sref, Lref, maxRate, target);
@@ -134,25 +143,67 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         lastTime_s = t;
         if (dt <= 0.0) return true;
 
-        // 1) Feed predictor with the live sim step (it reads V, orientation, altitude, etc.)
-        try {
-            log.debug("[Airbrakes] t={}: Updating predictor", t);
-            predictor.postStep(status); // safe: we call it explicitly to keep everything in one listener
-            double predictedApogee = predictor.getLatestPredictedApogee();
-            log.debug("[Airbrakes] Predicted apogee: {} m", predictedApogee);
-        } catch (Throwable ex) {
-            // predictor is best-effort; don't fail the sim if something goes wrong
-            log.debug("[Airbrakes] predictor.postStep error: {}", ex.toString());
+        // ------------------- WORLD-Z VERTICAL KINEMATICS (UP-POSITIVE) --------
+        final Coordinate vWorld = status.getRocketVelocity();
+        final double vAxis      = (vWorld != null) ? vWorld.z : 0.0;  // vertical up
+        final double alt        = safeGet(status, FlightDataType.TYPE_ALTITUDE, 0.0);
+
+        double aNetAxis = Double.NaN;
+        if (lastVaxis != null) aNetAxis = (vAxis - lastVaxis) / Math.max(1e-6, dt);
+        lastVaxis = vAxis;
+
+        // For gating only (don’t subtract g when calling predictor.update)
+        final double gAxis   = -G;                                 // gravity along +Z up is negative
+        final double aMinusG = Double.isFinite(aNetAxis) ? (aNetAxis - gAxis) : Double.NaN;
+        // ----------------------------------------------------------------------
+
+        // --------------------- COAST GATING (listener-level) ------------------
+        boolean thrustGate = false, accelGate = false, timeGate = false;
+        final double thrust = safeGet(status, FlightDataType.TYPE_THRUST_FORCE, Double.NaN);
+        if (Double.isFinite(thrust) && thrust <= THRUST_EPSILON_N) {
+            thrustZeroHits++;
+            thrustGate = (thrustZeroHits >= THRUST_CONSEC_HITS);
+        } else {
+            thrustZeroHits = 0;
         }
 
-        // 2) Run controller (bang-bang on predicted apogee)
+        // **FIX 1**: remove velocity sign from accel gate — let samples in as soon as decel is small
+        if (Double.isFinite(aMinusG) && aMinusG <= ACCEL_MINUS_G_THRESH) {
+            accelGateHits++;
+            accelGate = (accelGateHits >= ACCEL_CONSEC_HITS);
+        } else {
+            accelGateHits = 0;
+        }
+
+        timeGate = (t >= COAST_TIME_FALLBACKS);
+
+        if (!coastLatched && (thrustGate || accelGate || timeGate)) {
+            coastLatched = true;
+            log.debug("[Airbrakes] t={}s: COAST latched (thrustGate={}, accelGate={}, timeGate={}), v0={} m/s",
+                    String.format("%.3f", t), thrustGate, accelGate, timeGate, String.format("%.2f", vAxis));
+        }
+
+        // -------------------- FEED PREDICTOR (Python parity) ------------------
+        // **FIX 2**: remove velocity sign from predictor feed — collect as soon as coast is latched
+        if (coastLatched && Double.isFinite(aNetAxis)) {
+            predictor.update(aNetAxis, dt, alt, vAxis); // accel includes g (parity with Python)
+            final Double ap = predictor.getPredictionIfReady();
+            if (ap != null) {
+                log.debug("[Airbrakes] t={}s: Predictor apogee ready: {} m",
+                        String.format("%.3f", t), String.format("%.2f", ap));
+            } else {
+                log.debug("[Airbrakes] t={}s: Predictor not converged yet (samples={})",
+                        String.format("%.3f", t), predictor.sampleCount());
+            }
+        }
+
+        // --------------- Controller: bang-bang using predictor ----------------
         try {
-            log.debug("[Airbrakes] t={}: Running controller", t);
-            double oldCommand = commandedDeploy;
+            double before = commandedDeploy;
             controller.update(status);
-            if (oldCommand != commandedDeploy) {
-                log.info("[Airbrakes] t={}: Controller changed command from {} to {}", 
-                        t, oldCommand, commandedDeploy);
+            if (before != commandedDeploy) {
+                log.info("[Airbrakes] t={}s: Controller changed command {} -> {}",
+                        String.format("%.3f", t), before, commandedDeploy);
             }
         } catch (Throwable ex) {
             log.debug("[Airbrakes] controller.update error: {}", ex.toString());
@@ -164,10 +215,13 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double hi    = Math.min(1.0, commandedDeploy + dmax);
         double oldDeploy = deploy;
         deploy = clamp01(clamp(deploy, lo, hi));
-        
-        if (Math.abs(deploy - oldDeploy) > 0.001) {
-            log.debug("[Airbrakes] t={}: Deployment changed from {:.4f} to {:.4f} (commanded: {}, dmax: {:.4f})",
-                    t, oldDeploy, deploy, commandedDeploy, dmax);
+        if (Math.abs(deploy - oldDeploy) > 1e-6) {
+            log.debug("[Airbrakes] t={}s: Deployment {} -> {} (cmd={}, dmax={})",
+                    String.format("%.3f", t),
+                    String.format("%.4f", oldDeploy),
+                    String.format("%.4f", deploy),
+                    String.format("%.2f", commandedDeploy),
+                    String.format("%.4f", dmax));
         }
 
         currentAirbrakeDeployment = deploy;
@@ -188,12 +242,12 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         if (deployFrac <= 1e-6) return base;
 
         final double t = status.getSimulationTime();
-        
+
         // Velocity magnitude
         final Coordinate vel = status.getRocketVelocity();
         final double V = (vel != null) ? vel.length() : 0.0;
         if (!(V > 0.1)) {
-            log.debug("[Airbrakes] t={}: Skipping aero calcs due to near-zero velocity ({} m/s)", t, V);
+            log.debug("[Airbrakes] t={}s: Skipping aero calcs due to near-zero velocity ({} m/s)", String.format("%.3f", t), V);
             return base; // avoid near-zero noise
         }
 
@@ -205,29 +259,28 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             try {
                 final double a = AirDensity.speedOfSoundISA(alt);
                 if (a > 1e-6) mach = V / a;
-                log.debug("[Airbrakes] t={}: Calculated Mach from V/a: {:.3f}", t, mach);
+                log.debug("[Airbrakes] t={}s: Calculated Mach from V/a: {}", String.format("%.3f", t), String.format("%.3f", mach));
             } catch (Throwable ignore) { /* fallback below */ }
         }
         if (!Double.isFinite(mach) || mach <= 0) {
-            try { 
-                mach = AirDensity.machFromV(V, alt); 
-                log.debug("[Airbrakes] t={}: Used utility to calculate Mach: {:.3f}", t, mach);
-            }
-            catch (Throwable ignore) { mach = 0.0; }
+            try {
+                mach = AirDensity.machFromV(V, alt);
+                log.debug("[Airbrakes] t={}s: Used utility to calculate Mach: {}", String.format("%.3f", t), String.format("%.3f", mach));
+            } catch (Throwable ignore) { mach = 0.0; }
         }
 
         // Dynamic pressure (compressibility-aware via effective density)
         final double rhoEff = AirDensity.rhoForDynamicPressure(alt, mach); // includes qc/q_inc above M~0.3
         final double q = 0.5 * rhoEff * V * V;
         if (!(q > EPS_Q)) {
-            log.debug("[Airbrakes] t={}: Skipping aero calcs due to insufficient dynamic pressure ({} Pa)", t, q);
+            log.debug("[Airbrakes] t={}s: Skipping aero calcs due to low dynamic pressure ({} Pa)", String.format("%.3f", t), q);
             return base;
         }
 
-        // Δcoeffs from tables (binary deploy handled inside AirbrakeAerodynamics if you made it so)
+        // Δcoeffs from tables
         double dCd_tab = aerodynamics.getIncrementalCd(mach, deployFrac);
         if (!Double.isFinite(dCd_tab) || Math.abs(dCd_tab) < 1e-12) {
-            log.debug("[Airbrakes] t={}: Invalid or negligible ΔCd={} from tables", t, dCd_tab);
+            log.debug("[Airbrakes] t={}s: Invalid or negligible ΔCd={} from tables", String.format("%.3f", t), dCd_tab);
             return base;
         }
 
@@ -235,9 +288,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         try {
             final double tmp = aerodynamics.getIncrementalCm(mach, deployFrac);
             if (Double.isFinite(tmp)) dCm_tab = tmp;
-            log.debug("[Airbrakes] t={}: Retrieved ΔCm={} from tables", t, dCm_tab);
-        } catch (Throwable ignore) { 
-            log.debug("[Airbrakes] t={}: No ΔCm available, using 0", t);
+            log.debug("[Airbrakes] t={}s: Retrieved ΔCm={} from tables", String.format("%.3f", t), dCm_tab);
+        } catch (Throwable ignore) {
+            log.debug("[Airbrakes] t={}s: No ΔCm available, using 0", String.format("%.3f", t));
         }
 
         // --- Force domain (apply ramp vs. very low-q) ---
@@ -245,8 +298,16 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double dF   = ramp * (q * Sref * dCd_tab);   // N
         final double dM   = ramp * (q * Sref * Lref * dCm_tab); // N·m
 
-        log.debug("[Airbrakes] t={}: alt={:.1f}m, V={:.1f}m/s, M={:.2f}, q={:.1f}Pa, deploy={:.2f}, ramp={:.2f}, dF={:.3f}N, dM={:.3f}Nm",
-                t, alt, V, mach, q, deployFrac, ramp, dF, dM);
+        log.debug("[Airbrakes] t={}s: alt={} m, V={} m/s, M={}, q={} Pa, deploy={}, ramp={}, dF={} N, dM={} N·m",
+                String.format("%.3f", t),
+                String.format("%.1f", alt),
+                String.format("%.1f", V),
+                String.format("%.2f", mach),
+                String.format("%.1f", q),
+                String.format("%.2f", deployFrac),
+                String.format("%.2f", ramp),
+                String.format("%.3f", dF),
+                String.format("%.3f", dM));
 
         // --- Back to coefficients for OR update ---
         final double inv_qS  = 1.0 / (q * Sref);
@@ -255,7 +316,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double dCd_eff = dF * inv_qS;     // == ramp * dCd_tab when valid
         final double dCm_eff = dM * inv_qSL;    // == ramp * dCm_tab when valid
 
-        log.debug("[Airbrakes] t={}: Applying effective ΔCd={:.4f}, ΔCm={:.4f}", t, dCd_eff, dCm_eff);
+        log.debug("[Airbrakes] t={}s: Applying effective ΔCd={}, ΔCm={}",
+                String.format("%.3f", t), String.format("%.4f", dCd_eff), String.format("%.4f", dCm_eff));
 
         // ---- Apply ΔC* via reflection on AerodynamicForces ----
         final boolean cdApplied = addToDoubleProperty(base, dCd_eff,
@@ -282,12 +344,10 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.error("[Airbrakes] Simulation ended with error", e);
         } else {
             log.info("[Airbrakes] Simulation complete – final deploy={}, commanded={}", deploy, commandedDeploy);
-            
-            // Additional debugging info at sim end
             if (predictor != null) {
-                log.info("[Airbrakes] Final predicted apogee: {} m", predictor.getLatestPredictedApogee());
+                final Double ap = predictor.getPredictionIfReady();
+                log.info("[Airbrakes] Final predicted apogee: {}", (ap != null) ? ap : "n/a");
             }
-            
             double altitude = safeGet(status, FlightDataType.TYPE_ALTITUDE, -1);
             log.info("[Airbrakes] Final altitude: {} m", altitude);
         }
@@ -309,22 +369,15 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     private static double safeTargetApogee(AirbrakeConfig cfg) {
         try {
-            // Prefer a dedicated getter if present
             Method m = cfg.getClass().getMethod("getTargetApogee");
             Object v = m.invoke(cfg);
             if (v instanceof Number) return ((Number) v).doubleValue();
         } catch (Throwable ignore) { /* fall through */ }
-        // Fallback to 0 if not configured
         return 0.0;
     }
 
-    /**
-     * Adds delta to a double property on 'obj' using common setter spellings.
-     * Returns true if applied.
-     */
     private static boolean addToDoubleProperty(final Object obj, final double value, final String... setterCandidates) {
         if (!Double.isFinite(value)) return true;
-        // Try any direct setter first.
         for (String name : setterCandidates) {
             try {
                 Method m = obj.getClass().getMethod(name, double.class);
@@ -333,7 +386,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             } catch (NoSuchMethodException ignored) { /* try next */ }
             catch (Throwable t) { /* try next */ }
         }
-        // Fallback: read-modify-write if a getter exists (rare with OR internals)
         Double current = tryGetAnyDouble(obj,
                 "getDragCoefficient", "getCD", "getCx", "getAxialForceCoefficient", "getCDAxial",
                 "getPitchingMomentCoefficient", "getCM", "getCm", "getCMy", "getCmPitch"
@@ -364,10 +416,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         return null;
     }
 
-    /**
-     * Best-effort: write a user-visible "Airbrake Extension (%)".
-     * On some OR versions there's no API for dynamic columns; this silently no-ops.
-     */
     private static void tryEmitExtensionToFlightData(final SimulationStatus st, final double deployFrac) {
         try {
             final Object branch = st.getFlightDataBranch();
@@ -382,7 +430,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     }
 
     private static double qRampScale(double q) {
-        // linear ramp 0→1 between Q_RAMP_START_PA and Q_RAMP_FULL_PA
         if (!(q > 0)) return 0.0;
         final double t = (q - Q_RAMP_START_PA) / (Q_RAMP_FULL_PA - Q_RAMP_START_PA);
         return Math.max(0.0, Math.min(1.0, t));
