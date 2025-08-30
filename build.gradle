@@ -44,13 +44,33 @@ dependencies {
     implementation 'org.slf4j:slf4j-api:2.0.7'
     runtimeOnly 'org.slf4j:slf4j-simple:2.0.7'
 
-    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
-    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
+    // Update existing test dependencies to newer versions
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.12.0'
+    
+    // Use a minimal SLF4J backend specifically for tests
+    testRuntimeOnly 'org.slf4j:slf4j-simple:2.0.13'
+    
+    // OpenRocket for tests (choose one option)
+    // Option A: If you already have the JAR locally
+    testImplementation files("libs/${openRocketJarName}")
+    
+    // Option B (commented out): If you published to local maven
+    // testImplementation 'info.openrocket:openrocket-core:24.12'
 }
 
+// Update Java version settings to 24
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
 }
 
 shadowJar {

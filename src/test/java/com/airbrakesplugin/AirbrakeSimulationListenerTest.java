@@ -1,181 +1,162 @@
-// package com.airbrakesplugin;
+package com.airbrakesplugin;
 
-// import net.sf.openrocket.aerodynamics.AerodynamicForces;
-// import net.sf.openrocket.rocketcomponent.Rocket;
-// import net.sf.openrocket.simulation.FlightDataType;
-// import net.sf.openrocket.simulation.SimulationStatus;
-// import net.sf.openrocket.simulation.listeners.SimulationListener;
-// import net.sf.openrocket.util.Coordinate;
-// import net.sf.openrocket.simulation.FlightData;
-// import net.sf.openrocket.simulation.FlightDataBranch;
-// import org.junit.jupiter.api.DisplayName;
-// import org.junit.jupiter.api.Test;
-// import org.junit.jupiter.api.extension.ExtendWith;
-// import org.mockito.Mock;
-// import org.mockito.junit.jupiter.MockitoExtension;
+import com.airbrakesplugin.util.ApogeePredictor;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
-// import java.lang.reflect.Field;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
-// import static org.junit.jupiter.api.Assertions.*;
-// import static org.mockito.ArgumentMatchers.*;
-// import static org.mockito.Mockito.*;
+import info.openrocket.core.simulation.FlightDataBranch;
+import info.openrocket.core.simulation.FlightDataType;
+import info.openrocket.core.rocketcomponent.Rocket;
+import info.openrocket.core.simulation.SimulationStatus;
+import info.openrocket.core.util.Coordinate;
 
-// /**
-//  * Unit–tests for {@link AirbrakeSimulationListener}.  We verify only the pure “book-keeping” logic
-//  * (rate-limited deployment and coefficient injection) by mocking out OpenRocket classes.
-//  *
-//  * NOTE: These tests assume OpenRocket’s runtime classes are on the test class-path (compileOnly
-//  * for production, but testImplementation in Gradle).
-//  */
-// @ExtendWith(MockitoExtension.class)
-// @DisplayName("AirbrakeSimulationListener contract tests")
-// class AirbrakeSimulationListenerTest {
-//     // ---------- Common fixtures ----------
-//     @Mock Rocket rocket;                                    // not used by SUT logic directly
-//     @Mock SimulationStatus status;
-//     @Mock FlightDataBranch flightData;
-//     @Mock AerodynamicForces forces;
+import java.lang.reflect.Field;
 
-//     private static AirbrakeConfig minimalConfig() {
-//         AirbrakeConfig c = new AirbrakeConfig();
-//         c.setCfdDataFilePath("dummy.csv");  // anything non-blank to satisfy ctor
-//         c.setMaxDeploymentRate(0.5);        // 0.5 per second for rate-limit test
-//         return c;
-//     }
+/**
+ * Drives AirbrakeSimulationListener.preStep(...) with numbers from your debug log.
+ * Verifies:
+ *  - No "coast" sampling before burnout (1.45 s) even though your log showed 1.005 s.
+ *  - After burnout, predictor outputs apogee and controller commands extension (apogee > 548.64 m).
+ */
+public class AirbrakeSimulationListenerTest {
 
-//     // ---------- Helper to sneak mocks into private fields ----------
-//     private static void inject(Object target, String fieldName, Object value) throws Exception {
-//         Field f = target.getClass().getDeclaredField(fieldName);
-//         f.setAccessible(true);
-//         f.set(target, value);
-//     }
+    // ---- From your Debuglog.xlsx ----
+    private static final double SREF_M2        = 0.008706;
+    private static final double LREF_M         = 0.101598984;
+    private static final double MAX_RATE_FRACS = 4.0;
+    private static final double TARGET_APOGEE  = 548.64;        // m
+    private static final double T_COAST_LOG    = 1.005;         // s (bad early latch in your log)
+    private static final double VZ_AT_T_COAST  = 94.93;         // m/s
+    private static final double ALT_AT_T_COAST = 50.144459634329785; // m
+    private static final double T_BURNOUT      = 1.45;          // s
+    private static final double G              = 9.80665;       // m/s^2
 
-//     // ---------- Test 1: rate-limited deployment in preStep ----------
-//     @Test
-//     @DisplayName("preStep() honours max deployment rate")
-//     void preStep_rateLimitRespected() throws Exception {
-//         // Arrange -----------------------------------------------------------------
-//         AirbrakeSimulationListener listener =
-//                 new AirbrakeSimulationListener(minimalConfig(), rocket);
+    private static final double T_START        = 0.95;          // s
+    private static final double A_THRUST       = +15.0;         // m/s^2 (net accel while thrusting)
+    private static final double DT             = 0.01;          // s
 
-//         // Mock controller that always asks for full deployment
-//         AirbrakeController controller = mock(AirbrakeController.class);
-//         when(controller.getCommandedDeployment(anyDouble(), anyDouble(), anyDouble(),
-//                                                anyDouble(), any(SimulationStatus.class)))
-//              .thenReturn(1.0);
+    // Back-solved initial state to hit your logged (t=1.005, vz=94.93, alt≈50.14) under +15 m/s^2
+    private double vzStart;
+    private double altStart;
 
-//         // Provide a stub aerodynamics (not used in preStep but required for null-guard)
-//         AirbrakeAerodynamics aero = mock(AirbrakeAerodynamics.class);
+    @BeforeEach
+    public void backSolveInitials() {
+        final double dt = T_COAST_LOG - T_START;
+        vzStart  = VZ_AT_T_COAST - A_THRUST * dt;
+        altStart = ALT_AT_T_COAST - vzStart * dt - 0.5 * A_THRUST * dt * dt;
+        assertTrue(vzStart > 0);
+        assertTrue(altStart > 0);
+    }
 
-//         inject(listener, "controller",   controller);
-//         inject(listener, "aerodynamics", aero);
-//         inject(listener, "previousTime", 0.0);              // simulation starts at t = 0
+    @Test
+    public void listener_blocksEarlyCoast_and_extendsAfterBurnout() throws Exception {
+        // --- Configuration from log ---
+        final AirbrakeConfig cfg = new AirbrakeConfig();
+        cfg.setCfdDataFilePath("ignored.csv");     // we’ll inject a dummy aero object
+        cfg.setReferenceArea(SREF_M2);
+        cfg.setReferenceLength(LREF_M);
+        cfg.setMaxDeploymentRate(MAX_RATE_FRACS);
+        cfg.setTargetApogee(TARGET_APOGEE);
+        cfg.setDeployAltitudeThreshold(0.01);
+        cfg.setMaxMachForDeployment(1.0);
+        cfg.setAlwaysOpenMode(false);
+        cfg.setAlwaysOpenPercentage(1.0);
+        cfg.setApogeeToleranceMeters(5.0);
 
-//         // SimulationStatus:  Δt = 1 s  -------------------------------------------
-//         when(status.getSimulationTime()).thenReturn(1.0);
-//         when(status.getFlightData()).thenReturn(flightData);
-//         when(flightData.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(0.3);
-//         when(status.getRocketVelocity()).thenReturn(new net.sf.openrocket.util.Coordinate(0,0,100));
-//         when(status.getRocketPosition()).thenReturn(new net.sf.openrocket.util.Coordinate(0,0,50));
+        // Mock a Rocket to satisfy constructor (unused in this test path)
+        final Rocket rocket = mock(Rocket.class);
 
-//         // Act ---------------------------------------------------------------------
-//         listener.preStep(status);
+        // Listener under test
+        final AirbrakeSimulationListener listener = new AirbrakeSimulationListener(cfg, rocket);
 
-//         // Assert rate-limit:  maxRate(0.5/s) * dt(1 s)  => 0.5 expected deployment
-//         Field current = listener.getClass().getDeclaredField("currentDeployment");
-//         current.setAccessible(true);
-//         double actualDeployment = current.getDouble(listener);
+        // ---- Wire internals manually (we're not calling startSimulation) ----
+        // predictor
+        final Field predF = AirbrakeSimulationListener.class.getDeclaredField("predictor");
+        predF.setAccessible(true);
+        final ApogeePredictor predictor = new ApogeePredictor();
+        predF.set(listener, predictor);
 
-//         assertEquals(0.5, actualDeployment, 1e-12,
-//                      "Deployment should be clamped to maxRate * dt");
-//     }
+        // controller with a capture context (min/max coast windows: 0.5–5.0 s for a snappier test)
+        final Field ctrlF = AirbrakeSimulationListener.class.getDeclaredField("controller");
+        ctrlF.setAccessible(true);
+        final TestCtx ctx = new TestCtx();
+        final AirbrakeController controller = new AirbrakeController(
+                TARGET_APOGEE, predictor, ctx, 0.5, 5.0
+        );
+        ctrlF.set(listener, controller);
 
-//     // ---------- Test 2: coefficient injection in postAerodynamicCalculation ----------
-//     @Test
-//     @DisplayName("postAerodynamicCalculation adds ΔCᴅ and ΔCᴍ to forces")
-//     void postAeroCalculation_appliesCoefficients() throws Exception {
-//         // Arrange -----------------------------------------------------------------
-//         AirbrakeSimulationListener listener =
-//                 new AirbrakeSimulationListener(minimalConfig(), rocket);
+        // dummy aerodynamics so preStep doesn't early-return (not used by preStep)
+        final Field aeroF = AirbrakeSimulationListener.class.getDeclaredField("aerodynamics");
+        aeroF.setAccessible(true);
+        aeroF.set(listener, mock(AirbrakeAerodynamics.class));
 
-//         // Inject ready-to-go mocks
-//         AirbrakeAerodynamics aero = mock(AirbrakeAerodynamics.class);
-//         when(aero.getIncrementalCd(anyDouble(), anyDouble())).thenReturn(0.03);
-//         when(aero.getIncrementalCm(anyDouble(), anyDouble())).thenReturn(0.01);
+        // If your listener caches "sim", inject it (optional)
+        final SimulationStatus status = mock(SimulationStatus.class, withSettings().lenient());
+        try {
+            Field simF = AirbrakeSimulationListener.class.getDeclaredField("sim");
+            simF.setAccessible(true);
+            simF.set(listener, status);
+        } catch (NoSuchFieldException ignore) { /* ok */ }
 
-//         inject(listener, "aerodynamics", aero);
-//         inject(listener, "currentDeployment", 1.0);   // ensure > 1e-3 so logic executes
+        // Mockito FDB + Mach
+        final FlightDataBranch fdb = mock(FlightDataBranch.class, withSettings().lenient());
+        when(status.getFlightDataBranch()).thenReturn(fdb);
+        when(fdb.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(0.30); // subsonic → controller allowed
 
-//         // Baseline coefficients
-//         when(forces.getCD()).thenReturn(0.30);
-//         when(forces.getCm()).thenReturn(0.05);
+        // ---- Phase 1: thrusting (should NOT sample predictor / latch coast) ----
+        double t = T_START;
+        double vz = vzStart;
+        double alt = altStart;
 
-//         // Status → only Mach needed here
-//         when(status.getFlightData()).thenReturn(flightData);
-//         when(flightData.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(0.7);
+        while (t < T_BURNOUT) {
+            tick(listener, status, fdb, t, alt, vz);
+            vz  += A_THRUST * DT;
+            alt += vz * DT;
+            t   += DT;
+        }
+        // Assert no predictor samples yet => no early "coast" path taken
+        assertEquals(0, predictor.sampleCount(), "Predictor received coast samples before burnout — gating is wrong.");
 
-//         // Act ---------------------------------------------------------------------
-//         AerodynamicForces returned = listener.postAerodynamicCalculation(status, forces);
+        // ---- Phase 2: coast (−g). Now we expect predictions + a command to extend. ----
+        boolean extended = false;
+        for (int i = 0; i < 1200; i++) { // ~12 s
+            tick(listener, status, fdb, t, alt, vz);
+            vz  += -G * DT;
+            alt += vz * DT;
+            t   += DT;
 
-//         // Assert ------------------------------------------------------------------
-//         assertSame(forces, returned, "Should return the *same* AerodynamicForces instance");
+            // As soon as best-effort or strict produces apogee above target, controller should extend
+            if (ctx.extended) { extended = true; break; }
+            if (vz <= 0) break; // reached apogee
+        }
 
-//         verify(forces).setCD(0.30 + 0.03);   // 0.33 expected
-//         verify(forces).setCm(0.05 + 0.01);   // 0.06 expected
-//     }
+        assertTrue(extended, "Airbrakes were never commanded to extend even though predicted apogee > target.");
+        assertTrue(ctx.extended, "Airbrakes should remain extended once apogee > target.");
+    }
 
-//     // ---------- Test 3: NaN safeguard ----------
-//     @Test
-//     @DisplayName("postAerodynamicCalculation skips update when CFD returns NaN")
-//     void postAeroCalculation_skipsOnNaN() throws Exception {
-//         AirbrakeSimulationListener listener =
-//                 new AirbrakeSimulationListener(minimalConfig(), rocket);
+    private static void tick(AirbrakeSimulationListener listener,
+                             SimulationStatus status,
+                             FlightDataBranch fdb,
+                             double t, double alt, double vz) {
+        when(status.getSimulationTime()).thenReturn(t);
+        when(status.getRocketVelocity()).thenReturn(new Coordinate(0, 0, vz));
+        when(status.getRocketPosition()).thenReturn(new Coordinate(0, 0, alt));
+        when(fdb.getLast(FlightDataType.TYPE_ALTITUDE)).thenReturn(alt);
+        try {
+            listener.preStep(status);
+        } catch (Throwable ex) {
+            fail("listener.preStep threw: " + ex);
+        }
+    }
 
-//         AirbrakeAerodynamics aero = mock(AirbrakeAerodynamics.class);
-//         when(aero.getIncrementalCd(anyDouble(), anyDouble())).thenReturn(Double.NaN);
-//         when(aero.getIncrementalCm(anyDouble(), anyDouble())).thenReturn(0.02);
-
-//         inject(listener, "aerodynamics", aero);
-//         inject(listener, "currentDeployment", 0.8);
-
-//         when(status.getFlightData()).thenReturn(flightData);
-//         when(flightData.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(1.2);
-
-//         listener.postAerodynamicCalculation(status, forces);
-
-//         // Neither coefficient setter should be invoked
-//         verify(forces, never()).setCD(anyDouble());
-//         verify(forces, never()).setCm(anyDouble());
-//     }
-//     // @Test
-//     // void dimensionalForceIsAdded() throws Exception {
-//     //     AirbrakeSimulationListener sut =
-//     //             new AirbrakeSimulationListener(minimalConfig(), rocket);
-
-//     //     inject(sut, "currentDeployment", 1.0);
-//     //     AirbrakeAerodynamics aero = mock(AirbrakeAerodynamics.class);
-//     //     when(aero.getIncrementalCd(anyDouble(), anyDouble())).thenReturn(0.25); // big drag
-//     //     when(aero.getIncrementalCm(anyDouble(), anyDouble())).thenReturn(0.0);
-//     //     inject(sut, "aerodynamics", aero);
-
-//     //     when(status.getFlightData()).thenReturn(flightData);
-//     //     when(flightData.getLast(FlightDataType.TYPE_MACH_NUMBER)).thenReturn(0.5);
-
-//     //     Coordinate velocity = new Coordinate(0,0,150);    // 150 m/s straight up
-//     //     when(status.getRocketVelocity()).thenReturn(velocity);
-//     //     when(status.getRocketPosition()).thenReturn(new Coordinate(0,0,500));
-
-//     //     Coordinate baseF = new Coordinate(0,0,-40);       // 40 N baseline drag
-//     //     Coordinate baseM = new Coordinate();
-//     //     AerodynamicForces base = new AerodynamicForces();
-//     //     base.setCm(0.2);;
-//     //     // No direct setMoment method available in AerodynamicForces
-//     //     base.setCD(0.5);
-
-//     //     AerodynamicForces out = sut.postAerodynamicCalculation(status, base);
-
-//     //     // magnitude must increase:
-//     //     assertTrue(out.getCN().length() > baseF.length() + 10.0);
-//     // }
-
-// }
+    /** Capture controller commands. */
+    private static final class TestCtx implements AirbrakeController.ControlContext {
+        volatile boolean extended, retracted, switched;
+        @Override public void extend_airbrakes() { extended = true; }
+        @Override public void retract_airbrakes() { retracted = true; extended = false; }
+        @Override public void switch_altitude_back_to_pressure() { switched = true; }
+    }
+}
