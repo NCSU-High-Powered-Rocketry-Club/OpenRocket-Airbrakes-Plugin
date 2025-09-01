@@ -9,7 +9,8 @@ import java.util.Deque;
 /**
  * Apogee predictor (Python parity)
  *
- * Model: a(t) = A * (1 - B t)^4 fitted to COAST acceleration samples (accel includes gravity).
+ * Model: a(t) = A * (1 - B t)^4 fitted to COAST acceleration samples (accel includes gravity
+ * ).
  * LUT build: integrate (model - g) -> v, then v -> H; store ΔH(apogee - H) vs ascending v.
  * Query: apogee ≈ currentAltitude + interp(ΔH at current ascending velocity).
  *
