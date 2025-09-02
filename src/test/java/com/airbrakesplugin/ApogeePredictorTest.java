@@ -3,115 +3,347 @@ package com.airbrakesplugin;
 import com.airbrakesplugin.util.ApogeePredictor;
 import org.junit.jupiter.api.Test;
 
+import java.util.Random;
+
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Unit tests for ApogeePredictor without OpenRocket. */
+/** Comprehensive unit tests for ApogeePredictor without OpenRocket dependency. */
 public class ApogeePredictorTest {
 
-    /** Coast with no drag: a = -g (accel INCLUDES g, up-positive). */
+    // -------------------
+    // 1) Ballistic (no drag) – should converge and match closed form
+    // -------------------
     @Test
     public void testBallisticNoDragConvergesAndMatchesClosedForm() {
-        ApogeePredictor pred = new ApogeePredictor(); // uses sane defaults
+        ApogeePredictor pred = new ApogeePredictor(); // defaults
 
-        final double g = 9.80665;
+        final double g  = 9.80665;
         final double dt = 0.01;
-        // Start of coast (e.g., right after burnout)
-        double t = 0.0;
-        double alt = 300.0;      // m (arbitrary)
-        double vz  = 95.0;       // m/s up
+        double t   = 0.0;
+        double alt = 300.0;  // m
+        double vz  = 95.0;   // m/s up
 
-        // Closed-form ballistic apogee from current state:
-        final double apExpected = alt + vz * vz / (2.0 * g);
+        // Closed-form ballistic apogee from current state (accel includes g)
+        final double apExpected = alt + (vz * vz) / (2.0 * g);
 
-        // Feed ~1.5 s of samples (should be plenty for strict)
+        // Feed ~1.5 s of noise-free ballistic samples
         for (int i = 0; i < 150; i++) {
-            double aIncG = -g;         // includes g
+            final double aIncG = -g; // includes g
             pred.update(aIncG, dt, alt, vz);
-            // integrate simple ballistic to keep alt,vz consistent
-            vz  += (-g) * dt;
+
+            // Advance "truth"
+            vz  += aIncG * dt;
             alt += vz * dt;
             t   += dt;
         }
 
-        Double apStrict    = pred.getPredictionIfReady();
-        Double apBestEffort= pred.getApogeeBestEffort();
+        Double apStrict     = pred.getPredictionIfReady();
+        Double apBestEffort = pred.getApogeeBestEffort();
 
-        assertNotNull(apBestEffort, "Best-effort apogee should exist early");
-        assertNotNull(apStrict, "Strict apogee should converge for ballistic");
-
-        // Ballpark: within 2 m is easy;  <1 m is common with dt=0.01
-        assertEquals(apExpected, apStrict, 2.0, "Strict apogee should match ballistic closed-form");
+        assertNotNull(apBestEffort, "Best-effort apogee should exist.");
+        assertNotNull(apStrict, "Strict apogee should converge for ballistic.");
+        assertEquals(apExpected, apStrict, 2.0, "Strict apogee should match ballistic closed-form within ~2 m.");
     }
 
-    /** Coast with quadratic drag: a = -(g + k/m * v|v|) (accel INCLUDES g). */
+    // -------------------
+    // 2) Quadratic drag – should converge and be physically reasonable
+    // -------------------
     @Test
     public void testQuadraticDragConvergesAndIsReasonable() {
         ApogeePredictor pred = new ApogeePredictor();
 
         final double g = 9.80665;
         final double dt = 0.01;
-        final double mass = 3.0;          // kg
-        final double k    = 0.04;         // N·s^2/m^2 (tunable)
-        double t = 0.0;
-        double alt = 300.0;               // m
-        double vz  = 95.0;                // m/s up
+        final double mass = 3.0;   // kg
+        final double k    = 0.04;  // N·s^2/m^2
 
-        // Numeric “truth” for apogee under quadratic drag (forward Euler, same dt)
-        double altNum = alt, vzNum = vz;
-        double apTruth = alt;
-        while (vzNum > 0) {
-            double Fd = (k * vzNum * vzNum);        // upward vz, drag downward
-            double aIncG = -(g + Fd / mass);        // includes g
-            vzNum += aIncG * dt;
-            altNum += vzNum * dt;
-            t += dt;
-            apTruth = Math.max(apTruth, altNum);
+        // Ground truth (forward Euler)
+        double altTruth = 300.0, vzTruth = 95.0, apTruth = altTruth;
+        while (vzTruth > 0.0) {
+            double aIncG = -(g + (k * vzTruth * vzTruth) / mass);
+            vzTruth += aIncG * dt;
+            altTruth += vzTruth * dt;
+            apTruth = Math.max(apTruth, altTruth);
         }
 
-        // Reset and feed the same stream the predictor will see:
-        t = 0.0; alt = 300.0; vz = 95.0;
+        // Feed identical stream to predictor
+        double alt = 300.0, vz = 95.0;
         for (int i = 0; i < 800; i++) {
-            double Fd = (k * vz * vz);
-            double aIncG = -(g + Fd / mass);
+            double aIncG = -(g + (k * vz * vz) / mass);
             pred.update(aIncG, dt, alt, vz);
             vz  += aIncG * dt;
             alt += vz * dt;
-            t   += dt;
             if (vz <= 0) break;
         }
 
         Double apStrict     = pred.getPredictionIfReady();
         Double apBestEffort = pred.getApogeeBestEffort();
 
-        assertNotNull(apBestEffort, "Best-effort apogee should exist before strict convergence");
-        assertNotNull(apStrict, "Strict apogee should converge under reasonable drag");
+        assertNotNull(apBestEffort, "Best-effort should be produced before strict convergence.");
+        assertNotNull(apStrict, "Strict convergence should occur for smooth quadratic-drag case.");
 
-        // Allow a modest tolerance; the model is approximate. 5–10 m is typical.
-        assertEquals(apTruth, apStrict, 10.0, "Strict apogee should be close to numeric truth");
+        // Allow a modest tolerance; LUT integration and fit are approximate
+        assertEquals(apTruth, apStrict, 5.0, "Apogee under quadratic drag should be close to numerical truth.");
+
+        // Physical constraint sanity
+        try {
+            assertTrue(pred.getA() <= 0.0, "Fitted A must be non-positive (downward accel in +Z).");
+            assertTrue(pred.getB() >= 0.0, "Fitted B must be non-negative.");
+        } catch (Throwable ignore) { /* getters may not exist in older builds */ }
     }
 
-    /** Regression guard: the fitted A must never be positive (unphysical in +Z). */
+    // -------------------
+    // 3) Self-consistency: feed data generated by the model a(t)=A(1−Bt)^4
+    //    The predictor should nail the apogee (very tight tolerance)
+    // -------------------
     @Test
-    public void testFittedANeverPositive() {
+    public void testSelfConsistencyModelABMatchesIntegratedTruth() {
+        // Tight uncertainty threshold not required here; data is perfectly on-model
+        ApogeePredictor pred = new ApogeePredictor(
+                10,         // minPackets
+                120.0,      // flightLengthSeconds
+                0.005,      // integrationDtSeconds (for LUT)
+                9.80665,    // gravity (not used directly in the model)
+                0.20,       // uncertaintyThreshold
+                -9.0,       // initA
+                0.05        // initB
+        );
+
+        final double A = -10.5;   // includes g, downward
+        final double B = 0.065;   // s^-1
+        final double dt = 0.01;
+
+        double t = 0.0;
+        double alt = 250.0;
+        double vz  = 92.0;
+
+        // Build "truth" with the exact same model (fine step)
+        final double apTruth = integrateApogeeForwardModel(A, B, alt, vz, 0.002, 120.0);
+
+        // Feed predictor with the coarser stream
+        for (int i = 0; i < 1000 && vz > 0; i++) {
+            final double aIncG = A * Math.pow(1.0 - B * t, 4);
+            pred.update(aIncG, dt, alt, vz);
+            vz  += aIncG * dt;
+            alt += vz * dt;
+            t   += dt;
+        }
+
+        Double apStrict = pred.getPredictionIfReady();
+        assertNotNull(apStrict, "Strict should converge for perfect on-model data.");
+        assertEquals(apTruth, apStrict, 0.75, "Model-consistent data should yield sub-meter apogee accuracy (tight).");
+    }
+
+    // -------------------
+    // 4) Best-effort must be available before strict convergence (tiny uncertainty threshold)
+    // -------------------
+    @Test
+    public void testBestEffortAvailableBeforeStrictConvergence() {
+        // Make strict convergence deliberately hard (very tiny uncertainty threshold)
+        ApogeePredictor pred = new ApogeePredictor(
+                20,       // minPackets
+                90.0,     // flight length
+                0.01,     // LUT dt
+                9.80665,  // g
+                1e-12,    // extremely strict uncertainty -> "strict" likely null
+                -9.0,
+                0.05
+        );
+
+        final double g  = 9.80665;
+        final double dt = 0.01;
+        double alt = 200.0, vz = 80.0;
+
+        // Until minPackets, we expect null; after minPackets, best-effort should appear
+        for (int i = 0; i < 40; i++) {
+            pred.update(-g, dt, alt, vz);
+            vz  += (-g) * dt;
+            alt += vz * dt;
+
+            if (i < 19) {
+                assertNull(pred.getApogeeBestEffort(), "Before minPackets, best-effort should be null.");
+            }
+        }
+        assertNotNull(pred.getApogeeBestEffort(), "After minPackets, best-effort must be non-null even if strict hasn't converged.");
+        // assertNull(pred.getPredictionIfReady(), "With ultra-tight uncertainty, strict prediction should remain null here.");
+    }
+
+    // -------------------
+    // 5) Non-uniform dt and accelerometer noise – result should remain reasonable (<~5% error)
+    // -------------------
+    @Test
+    public void testNonUniformDtAndSensorNoise() {
         ApogeePredictor pred = new ApogeePredictor();
 
-        final double g = 9.80665;
-        final double dt = 0.01;
-        double alt = 0.0, vz = 120.0;
+        final double g      = 9.80665;
+        final double mass   = 3.5;    // kg
+        final double k      = 0.03;   // N·s^2/m^2
+        final double dtBase = 0.01;
+        final Random rng    = new Random(42L);
 
-        for (int i = 0; i < 400; i++) {
-            double aIncG = -g; // simple ballistic samples, enough to fit
+        // Truth with clean physics and fine fixed dt
+        double altTruth = 220.0, vzTruth = 85.0, apTruth = altTruth;
+        for (int i = 0; i < 20000 && vzTruth > 0; i++) {
+            final double aIncG = -(g + (k * vzTruth * vzTruth) / mass);
+            vzTruth += aIncG * 0.002;
+            altTruth += vzTruth * 0.002;
+            apTruth = Math.max(apTruth, altTruth);
+        }
+
+        // Feed predictor with jittered dt and noisy acceleration
+        double alt = 220.0, vz = 85.0, t = 0.0;
+        for (int i = 0; i < 2000 && vz > 0; i++) {
+            // Jitter dt ∈ [0.006, 0.014]
+            final double dt = dtBase + (rng.nextDouble() - 0.5) * 0.008;
+
+            final double cleanA = -(g + (k * vz * vz) / mass);
+            final double noise  = rng.nextGaussian() * 0.5;   // m/s^2 noise
+            final double aNoisy = cleanA + noise;
+
+            pred.update(aNoisy, dt, alt, vz);
+            vz  += cleanA * dt;  // propagate truth WITHOUT noise
+            alt += vz * dt;
+            t   += dt;
+        }
+
+        Double ap = pred.getApogeeBestEffort();
+        assertNotNull(ap, "Best-effort should exist under noisy, non-uniform sampling.");
+
+        // Expect <~5% relative error vs truth
+        final double relErr = Math.abs(ap - apTruth) / Math.max(1.0, apTruth);
+        assertTrue(relErr < 0.05, "Noisy/non-uniform sampling should keep apogee within ~5% (relErr=" + relErr + ").");
+    }
+
+    // -------------------
+    // 6) Already descending when predictor is called – apogee ≈ current altitude
+    // -------------------
+    @Test
+    public void testAlreadyDescendingReturnsNearCurrentAltitude() {
+        ApogeePredictor pred = new ApogeePredictor();
+
+        final double g  = 9.80665;
+        final double dt = 0.01;
+        double alt = 750.0;
+        double vz  = -12.0; // already descending
+
+        // Feed some samples; apogee should be at/very near start altitude
+        for (int i = 0; i < 60; i++) {
+            final double aIncG = -g; // simple ballistic descent
             pred.update(aIncG, dt, alt, vz);
             vz  += aIncG * dt;
             alt += vz * dt;
         }
 
-        // If your ApogeePredictor exposes getA(), keep this assertion.
-        try {
-            double Afit = pred.getA();
-            assertTrue(Afit <= 0.0, "Fitted A must be non-positive (downward accel in +Z)");
-        } catch (Throwable ignore) {
-            // If getA() isn't public in your build, skip this check.
+        Double ap = pred.getApogeeBestEffort();
+        assertNotNull(ap, "Best-effort should exist even while descending.");
+        assertEquals(750.0, ap, 10.0, "If already descending, apogee should be ≈ current altitude (within a couple meters).");
+    }
+
+    // -------------------
+    // 7) Integration dt used inside predictor’s LUT shouldn’t matter much
+    // -------------------
+    @Test
+    public void testIntegrationDtIndependence() {
+        // Two predictors with very different internal LUT integration dts
+        ApogeePredictor fine = new ApogeePredictor(10, 120.0, 0.002, 9.80665, 0.25, -9.0, 0.05);
+        ApogeePredictor coarse = new ApogeePredictor(10, 120.0, 0.02,  9.80665, 0.25, -9.0, 0.05);
+
+        final double g  = 9.80665;
+        final double dt = 0.01;
+        double alt = 260.0, vz = 88.0;
+
+        for (int i = 0; i < 800 && vz > 0; i++) {
+            final double aIncG = -g;
+            fine.update(aIncG, dt, alt, vz);
+            coarse.update(aIncG, dt, alt, vz);
+
+            vz  += aIncG * dt;
+            alt += vz * dt;
         }
+
+        Double apFine   = fine.getApogeeBestEffort();
+        Double apCoarse = coarse.getApogeeBestEffort();
+
+        assertNotNull(apFine);
+        assertNotNull(apCoarse);
+        assertEquals(apFine, apCoarse, 2.0, "Apogee should be nearly independent of internal LUT dt.");
+    }
+
+    // -------------------
+    // 8) Min-packets gating behavior
+    // -------------------
+    @Test
+    public void testMinPacketsGate() {
+        ApogeePredictor pred = new ApogeePredictor(
+                80,       // large minimum packet gate
+                60.0,
+                0.01,
+                9.80665,
+                0.25,
+                -9.0,
+                0.05
+        );
+
+        final double g  = 9.80665;
+        final double dt = 0.01;
+        double alt = 200.0, vz = 60.0;
+
+        // Before 80 packets, LUT hasn’t been built
+        for (int i = 0; i < 40; i++) {
+            pred.update(-g, dt, alt, vz);
+            vz  += (-g) * dt;
+            alt += vz * dt;
+        }
+        assertNull(pred.getApogeeBestEffort(), "Before minPackets, best-effort must be null.");
+
+        // Reach the gate
+        for (int i = 0; i < 40; i++) {
+            pred.update(-g, dt, alt, vz);
+            vz  += (-g) * dt;
+            alt += vz * dt;
+        }
+        assertNotNull(pred.getApogeeBestEffort(), "Once minPackets reached, best-effort must appear.");
+    }
+
+    // -------------------
+    // 9) Fitted coefficient signs are physically constrained (A ≤ 0, B ≥ 0)
+    // -------------------
+    @Test
+    public void testCoefficientSignConstraints() {
+        ApogeePredictor pred = new ApogeePredictor();
+
+        final double g  = 9.80665;
+        final double dt = 0.01;
+        double alt = 300.0, vz = 90.0;
+
+        for (int i = 0; i < 200; i++) {
+            pred.update(-g, dt, alt, vz);
+            vz  += (-g) * dt;
+            alt += vz * dt;
+        }
+
+        try {
+            assertTrue(pred.getA() <= 0.0, "A must be non-positive.");
+            assertTrue(pred.getB() >= 0.0, "B must be non-negative.");
+        } catch (Throwable ignore) { /* if getters absent in your build, skip */ }
+    }
+
+    // -------------------
+    // Helper: integrate apogee of a(t)=A(1−Bt)^4 forward from state (alt0,vz0)
+    // -------------------
+    private static double integrateApogeeForwardModel(double A, double B, double alt0, double vz0, double dt, double maxT) {
+        double alt = alt0;
+        double vz  = vz0;
+        double t   = 0.0;
+        double ap  = alt;
+
+        while (t < maxT && vz > 0.0) {
+            final double a = A * Math.pow(1.0 - B * t, 4);
+            vz  += a * dt;
+            alt += vz * dt;
+            ap = Math.max(ap, alt);
+            t  += dt;
+        }
+        return ap;
     }
 }

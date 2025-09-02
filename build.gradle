@@ -44,13 +44,12 @@ dependencies {
     implementation 'org.slf4j:slf4j-api:2.0.7'
     runtimeOnly 'org.slf4j:slf4j-simple:2.0.7'
 
-    // Update existing test dependencies to newer versions
+    // Tests
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
-    testImplementation 'org.mockito:mockito-core:5.12.0'
-    
-    // Use a minimal SLF4J backend specifically for tests
+    testImplementation 'org.mockito:mockito-core:5.13.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.13.0'
     testRuntimeOnly 'org.slf4j:slf4j-simple:2.0.13'
-    
+
     // OpenRocket for tests (choose one option)
     // Option A: If you already have the JAR locally
     testImplementation files("libs/${openRocketJarName}")
@@ -59,26 +58,39 @@ dependencies {
     // testImplementation 'info.openrocket:openrocket-core:24.12'
 }
 
-// Update Java version settings to 24
+// Ensure modern Byte Buddy for Java 24 compatibility
+configurations.all {
+    resolutionStrategy.eachDependency { d ->
+        if (d.requested.group == 'net.bytebuddy' && d.requested.name == 'byte-buddy') {
+            d.useVersion('1.15.+')
+        }
+        if (d.requested.group == 'net.bytebuddy' && d.requested.name == 'byte-buddy-agent') {
+            d.useVersion('1.15.+')
+        }
+    }
+}
+
+// Update Java version settings to 17
 java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
     
     toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
+        languageVersion = JavaLanguageVersion.of(17)
     }
 }
 
 tasks.withType(JavaCompile).configureEach {
-    options.release = 21
+    options.release = 17
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs += ['-Dnet.bytebuddy.experimental=true']
 }
 
 shadowJar {
     archiveBaseName.set('AirbrakePlugin')
     archiveClassifier.set('')
     archiveVersion.set(project.version.toString())
-}
-
-test {
-    useJUnitPlatform()
 }

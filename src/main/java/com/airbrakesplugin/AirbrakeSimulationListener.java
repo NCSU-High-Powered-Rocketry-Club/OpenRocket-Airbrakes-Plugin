@@ -201,7 +201,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             final int    nSamp   = predictor.sampleCount();
             final double Afit    = predictor.getA();
             final double Bfit    = predictor.getB();
-            final double[] sigs  = predictor.getUncertaintiesCopy();
+            final double[] sigs  = predictor.getUncertainties();
             final double  sigmaA = (sigs != null && sigs.length > 0) ? sigs[0] : Double.NaN;
             final double  sigmaB = (sigs != null && sigs.length > 1) ? sigs[1] : Double.NaN;
             final double  tgt    = controller.getTargetApogeeMeters();
@@ -220,9 +220,10 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
                     nSamp);
 
             if (apStrict == null) {
-                log.debug("[Airbrakes] t={}s: Predictor not converged (thr ~{}) – using best-effort until ready",
+                // FIX: never pass a double[] to a %f formatter. Log the array safely.
+                log.debug("[Airbrakes] t={}s: Predictor not converged (σ≈{}) – using best-effort until ready",
                         String.format("%.3f", t),
-                        String.format("%.3f", predictor.getUncertaintyThreshold()));
+                        fmt(sigs));
             }
         }
 
@@ -493,5 +494,16 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         if (!(q > 0)) return 0.0;
         final double t = (q - Q_RAMP_START_PA) / (Q_RAMP_FULL_PA - Q_RAMP_START_PA);
         return Math.max(0.0, Math.min(1.0, t));
+    }
+
+    // ---------- logging format helpers (array-safe) ----------
+    private static String fmt(double[] a) {
+        if (a == null) return "null";
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < a.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(String.format("%.3f", a[i]));
+        }
+        return sb.append("]").toString();
     }
 }
