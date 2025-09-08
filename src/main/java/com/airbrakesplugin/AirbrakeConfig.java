@@ -31,6 +31,15 @@ public class AirbrakeConfig {
     private boolean alwaysOpenMode;
     private double  alwaysOpenPercentage;
 
+    // Debug
+    private boolean debugEnabled = false;
+    private boolean dbgAlwaysOpen = false;
+    private double  dbgForcedDeployFrac = 1.0;   // 0..1
+    private boolean dbgTracePredictor = true;
+    private boolean dbgTraceController = true;
+    private boolean dbgWriteCsv = true;
+    private String  dbgCsvDir = "";              // empty ⇒ OS temp dir
+    private boolean dbgShowConsole = false;
     /** ±dead-band around set-point [m]; if {@code null} → default in controller. */
     private Double  apogeeToleranceMeters;
     
@@ -85,6 +94,33 @@ public class AirbrakeConfig {
     /** Optional tolerance accessor (controller calls via reflection). */
     public double getApogeeToleranceMeters() { return apogeeToleranceMeters; }
     public void setApogeeToleranceMeters(double tol) { this.apogeeToleranceMeters = tol; }
+
+    public boolean isDebugEnabled() { return debugEnabled; }
+    public void setDebugEnabled(boolean v) { this.debugEnabled = v; }
+
+    public boolean isDbgAlwaysOpen() { return dbgAlwaysOpen; }
+    public void setDbgAlwaysOpen(boolean v) { this.dbgAlwaysOpen = v; }
+
+    public double getDbgForcedDeployFrac() { return dbgForcedDeployFrac; }
+    public void setDbgForcedDeployFrac(double v) {
+        if (!Double.isFinite(v)) v = 0.0;
+        this.dbgForcedDeployFrac = Math.max(0.0, Math.min(1.0, v));
+    }
+
+    public boolean isDbgTracePredictor() { return dbgTracePredictor; }
+    public void setDbgTracePredictor(boolean v) { this.dbgTracePredictor = v; }
+
+    public boolean isDbgTraceController() { return dbgTraceController; }
+    public void setDbgTraceController(boolean v) { this.dbgTraceController = v; }
+
+    public boolean isDbgWriteCsv() { return dbgWriteCsv; }
+    public void setDbgWriteCsv(boolean v) { this.dbgWriteCsv = v; }
+
+    public String getDbgCsvDir() { return (dbgCsvDir == null ? "" : dbgCsvDir); }
+    public void setDbgCsvDir(String v) { this.dbgCsvDir = (v == null ? "" : v); }
+
+    public boolean isDbgShowConsole() { return dbgShowConsole; }
+    public void setDbgShowConsole(boolean v) { this.dbgShowConsole = v; }
 
     // =====================================================================
     private static double clamp01(double v) { return Math.max(0.0, Math.min(1.0, v)); }

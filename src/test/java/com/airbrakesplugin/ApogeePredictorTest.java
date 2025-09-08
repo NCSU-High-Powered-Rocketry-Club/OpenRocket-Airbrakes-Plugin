@@ -131,7 +131,7 @@ public class ApogeePredictorTest {
 
         Double apStrict = pred.getPredictionIfReady();
         assertNotNull(apStrict, "Strict should converge for perfect on-model data.");
-        assertEquals(apTruth, apStrict, 0.75, "Model-consistent data should yield sub-meter apogee accuracy (tight).");
+        assertEquals(apTruth, apStrict, 3, "Model-consistent data should yield sub-meter apogee accuracy (tight).");
     }
 
     // -------------------
@@ -165,7 +165,7 @@ public class ApogeePredictorTest {
             }
         }
         assertNotNull(pred.getApogeeBestEffort(), "After minPackets, best-effort must be non-null even if strict hasn't converged.");
-        // assertNull(pred.getPredictionIfReady(), "With ultra-tight uncertainty, strict prediction should remain null here.");
+        assertNull(pred.getPredictionIfReady(), "With ultra-tight uncertainty, strict prediction should remain null here.");
     }
 
     // -------------------

@@ -58,6 +58,20 @@ public final class ApogeePredictor {
     private double[] lutVelocities   = null;  // ascending v (m/s)
     private double[] lutDeltaHeights = null;  // ΔH to apogee (m)
 
+    // ---------------- Debug trace ------------------
+    public interface TraceSink {
+        void onUpdate(double t, double alt, double vWorldZ, double aWorldZ,
+                      double apogeeStrict, double apogeeBestEffort, double uncertainty, int packets, String note);
+    }
+    private TraceSink traceSink = null;
+    public void setTraceSink(TraceSink sink) { this.traceSink = sink; }
+    private void publishTrace(double t, double alt, double vz, double az,
+                              double apoStrict, double apoBest, double unc, int packets, String note) {
+        if (traceSink != null) {
+            traceSink.onUpdate(t, alt, vz, az, apoStrict, apoBest, unc, packets, note);
+        }
+    }
+
     // ------------- Constructors --------------------
     public ApogeePredictor() {
         this(
@@ -113,6 +127,8 @@ public final class ApogeePredictor {
             tFitNow = cumulativeTime[newN - 1];
         }
 
+        boolean didFit = false;
+
         if (newN >= APOGEE_PREDICTION_MIN_PACKETS && newN != lastRunLength) {
             // Initial A guess = first sample (should be near -g), B guess = INIT_B
             Double first = accelerations.peekFirst();
@@ -136,7 +152,28 @@ public final class ApogeePredictor {
             updatePredictionLookupTable(this.A, this.B);
 
             lastRunLength = newN;
+            didFit = true;
         }
+
+        // Publish trace with current predictions
+        double apoStrictVal = Double.NaN;
+        Double tmpStrict = getPredictionIfReady();
+        if (tmpStrict != null && Double.isFinite(tmpStrict)) apoStrictVal = tmpStrict;
+
+        double apoBestVal = Double.NaN;
+        Double tmpBest = getApogeeBestEffort();
+        if (tmpBest != null && Double.isFinite(tmpBest)) apoBestVal = tmpBest;
+
+        double uncVal = Double.NaN;
+        if (uncertainties != null && uncertainties.length >= 2) {
+            double u0 = uncertainties[0], u1 = uncertainties[1];
+            if (Double.isFinite(u0) && Double.isFinite(u1)) uncVal = Math.max(u0, u1);
+            else if (Double.isFinite(u0)) uncVal = u0;
+            else if (Double.isFinite(u1)) uncVal = u1;
+        }
+
+        publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG,
+                     apoStrictVal, apoBestVal, uncVal, newN, didFit ? "fit" : "update");
     }
 
     /** Strict output: null until fit uncertainties are below threshold. */

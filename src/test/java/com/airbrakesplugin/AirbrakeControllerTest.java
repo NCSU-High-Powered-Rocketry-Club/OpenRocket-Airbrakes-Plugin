@@ -2,323 +2,265 @@ package com.airbrakesplugin;
 
 import com.airbrakesplugin.util.ApogeePredictor;
 import info.openrocket.core.simulation.SimulationStatus;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Mockito-free tests for AirbrakeController.
- *
- * We supply a dynamic-proxy SimulationStatus that only implements getSimulationTime(),
- * since the controller only calls that method.
+ * Comprehensive, no-Mockito test suite for AirbrakeController.
+ * Uses a lightweight subclass (FakeStatus) instead of dynamic proxies.
+ * Each test prints a short summary to stdout to aid debugging.
  */
 public class AirbrakeControllerTest {
 
-    private static final double G = 9.80665; // m/s^2 downward (use negative in aAxis)
-    private final double[] timeRef = new double[]{0.0}; // single source of truth for sim time
-
-    // --- Minimal ControlContext that records commands ---
-    private static class Ctx implements AirbrakeController.ControlContext {
-        boolean extended = false;
-        boolean retracted = false;
-        int extendCount = 0;
-        int retractCount = 0;
-        final List<Double> timesExtended = new ArrayList<>();
-        final List<Double> timesRetracted = new ArrayList<>();
-        double now = 0.0;
-
-        void setNow(double t) { this.now = t; }
-
-        @Override public void extend_airbrakes() {
-            extended = true; retracted = false;
-            extendCount++;  timesExtended.add(now);
-        }
-        @Override public void retract_airbrakes() {
-            extended = false; retracted = true;
-            retractCount++;  timesRetracted.add(now);
-        }
-        @Override public void switch_altitude_back_to_pressure() { /* not used */ }
+    /** Minimal status that lets us control simulation time. */
+    private static final class FakeStatus extends SimulationStatus {
+        private double now = 0.0;
+        public void setNow(double t) { this.now = t; }
+        @Override public double getSimulationTime() { return now; }
     }
 
-    // --- Simple vertical world; feed predictor then advance kinematics ---
-    private static class World {
-        double t, alt, vz;
-        World(double t0, double alt0, double vz0) { t = t0; alt = alt0; vz = vz0; }
-        void step(ApogeePredictor pred, double aAxis, double dt) {
-            pred.update(aAxis, dt, alt, vz); // feed current state first
-            vz  += aAxis * dt;
-            alt += vz * dt;
-            t   += dt;
+    /** Control context that records commands and timestamps. */
+    private static final class Ctx implements AirbrakeController.ControlContext {
+        static final class Event {
+            final double t; final boolean extend;
+            Event(double t, boolean extend) { this.t = t; this.extend = extend; }
+            @Override public String toString() { return String.format("{t=%.3fs,%s}", t, extend ? "EXTEND" : "RETRACT"); }
         }
+        final List<Event> events = new ArrayList<>();
+        volatile boolean extended, retracted, switched;
+
+        @Override public void extend_airbrakes()  { extended = true;  retracted = false; }
+        @Override public void retract_airbrakes() { retracted = true; extended = false; }
+        @Override public void switch_altitude_back_to_pressure() { switched = true; }
+
+        void record(double t, boolean extend) { events.add(new Event(t, extend)); }
     }
 
-    private SimulationStatus status; // dynamic proxy
-    private Ctx ctx;
+    // ---------- Simple ballistic “coast” helper ----------
 
-    @BeforeEach
-    void setup() {
-        ctx = new Ctx();
-        status = timeOnlyStatus(timeRef);
-        timeRef[0] = 0.0;
+    private static final double g = 9.80665;
+
+    private static void stepBallistic(ApogeePredictor pred, double dt, double[] alt, double[] vz) {
+        final double aIncG = -g;             // up-positive accel including g
+        pred.update(aIncG, dt, alt[0], vz[0]);
+        vz[0]  += aIncG * dt;
+        alt[0] += vz[0] * dt;
     }
 
-    /** Create a dynamic-proxy SimulationStatus that serves only getSimulationTime(). */
-    private static SimulationStatus timeOnlyStatus(double[] timeRef) {
-        ClassLoader cl = SimulationStatus.class.getClassLoader();
-        return (SimulationStatus) Proxy.newProxyInstance(
-                cl,
-                new Class[]{ SimulationStatus.class },
-                (proxy, method, args) -> {
-                    String name = method.getName();
-                    if ("getSimulationTime".equals(name)) {
-                        return timeRef[0];
-                    }
-                    // Return safe defaults for everything else
-                    Class<?> rt = method.getReturnType();
-                    if (!rt.isPrimitive()) return null;
-                    if (rt == boolean.class) return false;
-                    if (rt == byte.class)    return (byte)0;
-                    if (rt == short.class)   return (short)0;
-                    if (rt == int.class)     return 0;
-                    if (rt == long.class)    return 0L;
-                    if (rt == float.class)   return 0f;
-                    if (rt == double.class)  return 0.0;
-                    if (rt == char.class)    return '\0';
-                    return null; // void
+    /** Small bundle to summarize a run. */
+    private static final class RunResult {
+        final double t, alt, vz;
+        final Double apBE, apStrict;
+        final boolean actedBE, actedStrict;
+        final int commandCount;
+        final List<Ctx.Event> events;
+        RunResult(double t, double alt, double vz, Double apBE, Double apStrict,
+                  boolean actedBE, boolean actedStrict, int commandCount, List<Ctx.Event> events) {
+            this.t=t; this.alt=alt; this.vz=vz; this.apBE=apBE; this.apStrict=apStrict;
+            this.actedBE=actedBE; this.actedStrict=actedStrict; this.commandCount=commandCount; this.events=events;
+        }
+        @Override public String toString() {
+            return String.format("t=%.3fs alt=%.2f m vz=%.2f m/s | apBE=%s apStrict=%s | actedBE=%s actedStrict=%s | commands=%d | events=%s",
+                    t, alt, vz, fmt(apBE), fmt(apStrict), actedBE, actedStrict, commandCount, events);
+        }
+        private static String fmt(Double x){ return x==null ? "null" : String.format("%.2f", x); }
+    }
+
+    /** Run a simple ballistic coast up to tEnd, calling the controller every step. */
+    private static RunResult runCoast(AirbrakeController ctl, ApogeePredictor pred,
+                                      FakeStatus status, double tEnd, double dt,
+                                      double alt0, double vz0, Ctx ctx) {
+        double t = 0.0;
+        double[] alt = new double[]{alt0};
+        double[] vz  = new double[]{vz0};
+
+        boolean actedBestEffort = false;
+        boolean actedStrict     = false;
+        int commands = 0;
+        boolean lastExtended = false;
+
+        while (t <= tEnd && vz[0] > -1.0) { // run a bit past apogee
+            stepBallistic(pred, dt, alt, vz);
+            t += dt;
+            status.setNow(t);
+
+            boolean acted = ctl.updateAndGateFlexible(status);
+            // Record events on state changes
+            if (acted) {
+                commands++;
+                boolean nowExtended = isExtended(ctl, ctx); // based on ctx flags
+                if (nowExtended != lastExtended) {
+                    ctx.record(t, nowExtended);
+                    lastExtended = nowExtended;
                 }
+                if (!pred.hasConverged()) actedBestEffort = true; else actedStrict = true;
+            }
+            if (actedStrict && actedBestEffort) break; // both phases observed
+        }
+
+        return new RunResult(
+                t, alt[0], vz[0],
+                pred.getApogeeBestEffort(),
+                pred.getPredictionIfReady(),
+                actedBestEffort, actedStrict, commands, ctx.events
         );
     }
 
-    // ---------- Helpers ----------
-    private static boolean isExtendDecision(double apogee, double target, double deadband) {
-        return (apogee - target) > deadband;
+    private static boolean isExtended(AirbrakeController ctl, Ctx ctx) {
+        // Controller only ever leaves one of these true.
+        return ctx.extended && !ctx.retracted;
     }
 
-    private static void advance(ApogeePredictor pred, World w, double dt, double aAxis,
-                                SimulationStatus status, Ctx ctx, double[] timeRef) {
-        w.step(pred, aAxis, dt);
-        timeRef[0] = w.t;
-        ctx.setNow(w.t);
-    }
+    // ======================== TESTS ========================
 
-    // ---------- Tests ----------
-
-    @Test
-    @DisplayName("No action before minCoast; then acts afterwards")
-    void noActionBeforeMinCoast_thenActs() {
-        final double target = 550.0, minCoast = 0.8, maxCoast = 5.0;
-
+    @Test @DisplayName("Above-target: extend using best-effort, then confirm with strict")
+    public void testExtendWhenAboveTarget_BEThenStrict() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
+        AirbrakeController ctl = new AirbrakeController(550.0, pred, ctx, 0.5, 5.0);
 
-        World w = new World(0.0, 300.0, 95.0);
-        // Before minCoast: must not act
-        for (int i = 0; i < 30; i++) { // 30*0.02 = 0.6 s
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            assertFalse(ctl.updateAndGateFlexible(status), "Should not act before minCoast");
-        }
-        // After minCoast: should act at least once soon
-        boolean actedAfter = false;
-        for (int i = 0; i < 200; i++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            if (ctl.updateAndGateFlexible(status)) { actedAfter = true; break; }
-        }
-        assertTrue(actedAfter, "Should act after minCoast when a usable apogee is available");
-        assertTrue(ctx.extendCount + ctx.retractCount >= 1);
+        RunResult rr = runCoast(ctl, pred, status, 6.0, 0.01, 300.0, 95.0, ctx);
+        System.out.println("[ExtendAboveTarget] " + rr);
+
+        assertTrue(rr.actedBE, "Expected at least one command using BEST-EFFORT before strict convergence.");
+        assertTrue(rr.actedStrict, "Expected a command again after STRICT convergence.");
+        assertTrue(ctx.extended, "Airbrakes should be EXTENDED (predicted apogee > target).");
+        assertTrue(rr.commandCount >= 1, "Expected at least one command.");
     }
 
-    @Test
-    @DisplayName("Decision aligns with STRICT when it becomes available (no duplicate command if unchanged)")
-    void strictConsistency_noDuplicate() {
-        final double target = 550.0, minCoast = 0.3, maxCoast = 5.0;
-
+    @Test @DisplayName("Below-target: retract and never extend")
+    public void testRetractWhenBelowTarget() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
+        AirbrakeController ctl = new AirbrakeController(200.0, pred, ctx, 0.5, 5.0); // target above reachable
 
-        World w = new World(0.0, 300.0, 95.0);
+        RunResult rr = runCoast(ctl, pred, status, 6.0, 0.01, 10.0, 15.0, ctx);
+        System.out.println("[RetractBelowTarget] " + rr);
 
-        // Run until the first action (likely best-effort) occurs after minCoast
-        int issued = 0;
-        for (int i = 0; i < 600 && issued == 0; i++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            if (ctl.updateAndGateFlexible(status)) issued++;
+        assertTrue(ctx.retracted, "Airbrakes should be RETRACTED (predicted apogee < target).");
+        assertFalse(ctx.extended, "Airbrakes must never be extended in this scenario.");
+    }
+
+    @Test @DisplayName("No samples yet: controller must hold (no action)")
+    public void testNoSamples_NoAction() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
+        ApogeePredictor pred = new ApogeePredictor();
+        AirbrakeController ctl = new AirbrakeController(500.0, pred, ctx, 0.5, 5.0);
+
+        boolean acted = ctl.updateAndGateFlexible(status);
+        System.out.println("[NoSamples] acted=" + acted);
+        assertFalse(acted, "Controller should not act when predictor has zero samples.");
+        assertFalse(ctx.extended || ctx.retracted, "No command should be issued without samples.");
+    }
+
+    @Test @DisplayName("Best-effort is gated by minCoastSeconds")
+    public void testBestEffortGatedByMinCoast() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
+        ApogeePredictor pred = new ApogeePredictor();
+        double minCoast = 1.0;
+        AirbrakeController ctl = new AirbrakeController(550.0, pred, ctx, minCoast, 10.0);
+
+        double[] alt = new double[]{300.0};
+        double[] vz  = new double[]{95.0};
+        for (int i=0; i<50; i++) {
+            stepBallistic(pred, 0.01, alt, vz);
+            status.setNow((i+1)*0.01);
+            boolean acted = ctl.updateAndGateFlexible(status);
+            if (acted) System.out.println("[BestEffortGated] Unexpected action at t=" + status.getSimulationTime());
+            assertFalse(acted, "Controller should not act on BEST-EFFORT before minCoastSeconds elapses.");
         }
-        assertTrue(issued > 0, "Controller should act once after minCoast.");
-        final int extendsAfterFirst = ctx.extendCount;
-        final int retractsAfterFirst = ctx.retractCount;
+        System.out.println("[BestEffortGated] Passed with no actions before minCoast=" + minCoast + " s.");
+    }
 
-        // Continue until STRICT is available; then verify state matches STRICT decision
-        boolean sawStrict = false;
-        for (int i = 0; i < 1500; i++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            Double strict = pred.getPredictionIfReady();
-            ctl.updateAndGateFlexible(status);
-            if (strict != null) {
-                sawStrict = true;
-                boolean shouldExtend = isExtendDecision(strict, target, 0.0);
-                assertEquals(shouldExtend, ctx.extended,
-                        "Once STRICT is available, commanded state should agree with STRICT decision.");
+    @Test @DisplayName("Command de-duplication: multiple calls, one command until sign flips")
+    public void testCommandDeduplication() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
+        ApogeePredictor pred = new ApogeePredictor();
+        AirbrakeController ctl = new AirbrakeController(550.0, pred, ctx, 0.2, 10.0);
+
+        double[] alt = new double[]{300.0};
+        double[] vz  = new double[]{95.0};
+        int actedCount = 0;
+
+        // Run to first command
+        for (int i=0; i<300; i++) {
+            stepBallistic(pred, 0.01, alt, vz);
+            status.setNow((i+1)*0.01);
+            boolean acted = ctl.updateAndGateFlexible(status);
+            if (acted) actedCount++;
+            if (actedCount > 0 && i > 20) break; // we have initial command, stop soon after
+        }
+
+        // More steps with no sign flip expected yet: should not issue repeated commands
+        int actedAfter = 0;
+        for (int i=0; i<200; i++) {
+            stepBallistic(pred, 0.01, alt, vz);
+            status.setNow(status.getSimulationTime() + 0.01);
+            boolean acted = ctl.updateAndGateFlexible(status);
+            if (acted) actedAfter++;
+        }
+
+        System.out.println("[Dedup] initialCommands=" + actedCount + " additionalCommands=" + actedAfter + " events=" + ctx.events);
+        assertTrue(actedCount >= 1, "Expected at least one initial command.");
+        assertEquals(0, actedAfter, "Expected no additional commands without a sign flip.");
+    }
+
+    @Test @DisplayName("Deadband: within +deadband of target => retract (one-sided threshold)")
+    public void testDeadbandOneSided() {
+        FakeStatus status = new FakeStatus();
+        Ctx ctx = new Ctx();
+        ApogeePredictor pred = new ApogeePredictor();
+
+        // Build an early best-effort apogee, then set target close to it
+        double[] alt = new double[]{300.0};
+        double[] vz  = new double[]{70.0};
+        Double apBE = null;
+        for (int i=0; i<150 && apBE == null; i++) {
+            stepBallistic(pred, 0.02, alt, vz);
+            status.setNow((i+1)*0.02);
+            apBE = pred.getApogeeBestEffort();
+        }
+        assertNotNull(apBE, "Expected an early best-effort estimate.");
+        double target = apBE;
+
+        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, 0.0, 10.0);
+        ctl.setApogeeDeadbandMeters(25.0); // extend only if ap > target + 25
+
+        boolean acted = ctl.updateAndGateFlexible(status);
+        System.out.println("[Deadband] target=" + target + " apBE=" + apBE + " acted=" + acted + " events=" + ctx.events);
+        assertTrue(acted, "Controller should issue an initial command.");
+        assertTrue(ctx.retracted && !ctx.extended, "Within deadband the controller retracts (one-sided threshold).");
+    }
+
+    @Test @DisplayName("Null context: state toggles still occur without NPE")
+    public void testNullContext_NoNPE() {
+        FakeStatus status = new FakeStatus();
+        ApogeePredictor pred = new ApogeePredictor();
+        AirbrakeController ctl = new AirbrakeController(550.0, pred, null, 0.2, 10.0);
+
+        double[] alt = new double[]{300.0};
+        double[] vz  = new double[]{95.0};
+
+        int acted = 0;
+        for (int i=0; i<400; i++) {
+            stepBallistic(pred, 0.01, alt, vz);
+            status.setNow((i+1)*0.01);
+            if (ctl.updateAndGateFlexible(status)) {
+                acted++;
                 break;
             }
         }
-        assertTrue(sawStrict, "Predictor never produced a STRICT apogee.");
-
-        // Ensure no duplicate command was sent just because STRICT appeared (if decision unchanged)
-        assertTrue(ctx.extendCount == extendsAfterFirst || ctx.retractCount == retractsAfterFirst,
-                "Should not issue a duplicate command if STRICT yields the same decision.");
-    }
-
-    @Test
-    @DisplayName("Deadband suppresses chatter near target")
-    void deadbandSuppressesChatter() {
-        final double minCoast = 0.2, maxCoast = 5.0;
-        ApogeePredictor pred = new ApogeePredictor();
-
-        // Fly to get STRICT prediction
-        World w = new World(0.0, 260.0, 100.0);
-        Double strictAp = null;
-        for (int i = 0; i < 1500 && strictAp == null; i++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            strictAp = pred.getPredictionIfReady();
-        }
-        assertNotNull(strictAp, "Failed to obtain a STRICT apogee for deadband test.");
-
-        // Controller with target ≈ STRICT and a deadband
-        double target = strictAp;
-        double deadband = 12.0; // ±12 m
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
-        ctl.setApogeeDeadbandMeters(deadband);
-
-        // Act once to establish a state
-        boolean actedOnce = false;
-        for (int i = 0; i < 200 && !actedOnce; i++) {
-            advance(pred, w, 0.01, -G, status, ctx, timeRef);
-            actedOnce = ctl.updateAndGateFlexible(status);
-        }
-
-        int toggles = 0;
-        boolean last = ctx.extended;
-        // Run a few seconds; prediction should hover near target
-        for (int i = 0; i < 600; i++) { // ~6 s
-            advance(pred, w, 0.01, -G, status, ctx, timeRef);
-            boolean acted = ctl.updateAndGateFlexible(status);
-            if (acted && ctx.extended != last) { toggles++; last = ctx.extended; }
-        }
-        assertTrue(toggles <= 1, "Deadband should prevent frequent toggling around target.");
-    }
-
-    @Test
-    @DisplayName("Under-target ⇒ retract; Over-target ⇒ extend")
-    void underOverTargetDecisions() {
-        final double minCoast = 0.3, maxCoast = 5.0;
-
-        // A) target very high ⇒ retract
-        {
-            ApogeePredictor pred = new ApogeePredictor();
-            AirbrakeController ctl = new AirbrakeController(1200.0, pred, ctx, minCoast, maxCoast);
-            World w = new World(0.0, 120.0, 70.0);
-            boolean acted = false;
-            for (int i = 0; i < 800 && !acted; i++) {
-                advance(pred, w, 0.02, -G, status, ctx, timeRef);
-                acted = ctl.updateAndGateFlexible(status);
-            }
-            assertTrue(acted, "Should act for under-target case.");
-            assertTrue(ctx.retracted, "Under target ⇒ retract.");
-        }
-
-        // Reset context
-        ctx = new Ctx();
-
-        // B) target low ⇒ extend
-        {
-            ApogeePredictor pred = new ApogeePredictor();
-            AirbrakeController ctl = new AirbrakeController(450.0, pred, ctx, minCoast, maxCoast);
-            World w = new World(0.0, 280.0, 95.0);
-            boolean acted = false;
-            for (int i = 0; i < 800 && !acted; i++) {
-                advance(pred, w, 0.02, -G, status, ctx, timeRef);
-                acted = ctl.updateAndGateFlexible(status);
-            }
-            assertTrue(acted, "Should act for over-target case.");
-            assertTrue(ctx.extended, "Over target ⇒ extend.");
-        }
-    }
-
-    @Test
-    @DisplayName("Command de-duplication: no repeated commands when state unchanged")
-    void deduplication() {
-        final double target = 500.0, minCoast = 0.2, maxCoast = 5.0;
-
-        ApogeePredictor pred = new ApogeePredictor();
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
-        World w = new World(0.0, 350.0, 90.0);
-
-        // Run until first action
-        int i = 0;
-        for (; i < 1500; i++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            if (ctl.updateAndGateFlexible(status)) break;
-        }
-        int extendFirst = ctx.extendCount;
-        int retractFirst = ctx.retractCount;
-
-        // Keep running under same sign of error; no new commands expected
-        for (int k = 0; k < 400; k++) {
-            advance(pred, w, 0.02, -G, status, ctx, timeRef);
-            ctl.updateAndGateFlexible(status);
-        }
-        assertEquals(extendFirst, ctx.extendCount,
-                "Should not re-issue EXTEND when already extended and decision unchanged.");
-        assertEquals(retractFirst, ctx.retractCount,
-                "Should not re-issue RETRACT when already retracted and decision unchanged.");
-    }
-
-    @Test
-    @DisplayName("Irregular solver cadence: gating is time-based, not tick-based")
-    void irregularCadence_timeGated() {
-        final double target = 550.0, minCoast = 0.75, maxCoast = 5.0;
-
-        ApogeePredictor pred = new ApogeePredictor();
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
-        World w = new World(0.0, 300.0, 95.0);
-
-        double[] dts = { 0.01, 0.07, 0.005, 0.16, 0.02, 0.18, 0.04, 0.06, 0.03, 0.21, 0.015, 0.01 };
-        boolean actedBefore = false, actedAfter = false;
-
-        for (double dt : dts) {
-            advance(pred, w, dt, -G, status, ctx, timeRef);
-            boolean acted = ctl.updateAndGateFlexible(status);
-            if (w.t < minCoast && acted) actedBefore = true;
-            if (w.t >= minCoast && acted) actedAfter = true;
-        }
-
-        assertFalse(actedBefore, "Must not act before minCoast even with jittery dt.");
-        assertTrue(actedAfter, "Should act after minCoast even with jittery dt.");
-    }
-
-    @Test
-    @DisplayName("Zero samples ⇒ controller holds (no firstCoastTime, no action)")
-    void zeroSamples_noAction() {
-        final double target = 600.0, minCoast = 0.2, maxCoast = 5.0;
-
-        ApogeePredictor pred = new ApogeePredictor();
-        AirbrakeController ctl = new AirbrakeController(target, pred, ctx, minCoast, maxCoast);
-
-        // Do not feed the predictor at all (sampleCount == 0)
-        timeRef[0] = 1.5; // even if time advances, without samples controller should hold
-        ctx.setNow(1.5);
-
-        for (int i = 0; i < 10; i++) {
-            assertFalse(ctl.updateAndGateFlexible(status), "With zero samples, controller should not act.");
-            timeRef[0] += 0.1;
-            ctx.setNow(timeRef[0]);
-        }
-        assertEquals(0, ctx.extendCount + ctx.retractCount);
+        System.out.println("[NullContext] acted=" + acted);
+        assertTrue(acted >= 1, "Expected at least one state change even with null context.");
     }
 }

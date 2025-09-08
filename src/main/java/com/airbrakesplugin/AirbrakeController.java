@@ -32,12 +32,18 @@ public final class AirbrakeController {
         void switch_altitude_back_to_pressure(); // optional, left to caller
     }
 
+    // Optional debug listener to observe commanded deployment decisions.
+    public interface DebugListener {
+        void addController(double timeSeconds, double u, String reason);
+    }
+
     private static final Logger log = LoggerFactory.getLogger(AirbrakeController.class);
 
     // --- Config ---
     private final double targetApogeeMeters;
     private final ApogeePredictor predictor;
     private ControlContext context;
+    private DebugListener dbg; // optional
 
     // Coast gating windows (seconds)
     private final double minCoastSeconds;
@@ -76,6 +82,7 @@ public final class AirbrakeController {
     // ----------------- API -----------------
 
     public void setContext(ControlContext ctx) { this.context = ctx; }
+    public void setDebugListener(DebugListener dbg) { this.dbg = dbg; }
 
     public double getTargetApogeeMeters() { return targetApogeeMeters; }
 
@@ -147,6 +154,26 @@ public final class AirbrakeController {
         // Decision with symmetric hysteresis around target
         final double err = ap - targetApogeeMeters;
         final double db = apogeeDeadbandMeters;
+
+        // Debug hook mirroring "getCommandedDeployment" style
+        // Example:
+        // if (/* under target beyond deadband */) { double u = 0.0; return u; }
+        // if (/* over target beyond deadband */)  { double u = 1.0; return u; }
+        // // within deadband
+        // return lastCmd;
+        if (dbg != null) {
+            double lastCmd = (lastExtended != null && lastExtended) ? 1.0 : 0.0;
+            if (err < -db) {
+                double u = 0.0; // retract
+                dbg.addController(t, u, "under-target");
+            } else if (err > db) {
+                double u = 1.0; // extend
+                dbg.addController(t, u, "over-target");
+            } else {
+                double u = lastCmd; // within deadband, hold
+                dbg.addController(t, u, "deadband-hold");
+            }
+        }
 
         boolean nextExtended;
         if (lastExtended == null) {

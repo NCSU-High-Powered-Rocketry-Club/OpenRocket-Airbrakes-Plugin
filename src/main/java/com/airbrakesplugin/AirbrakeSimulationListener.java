@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 
 import com.airbrakesplugin.util.AirDensity;
 import com.airbrakesplugin.util.ApogeePredictor;
+import com.airbrakesplugin.util.DebugTrace;
 
 import info.openrocket.core.aerodynamics.AerodynamicForces;
 import info.openrocket.core.rocketcomponent.Rocket;
@@ -70,6 +71,10 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private static final double Q_RAMP_FULL_PA  = 50.0;  // full effect by ~50 Pa
     private static final double EPS_Q           = 1e-6;
 
+    // ---- Debug trace ---------------------------------------------------------
+    // Fields
+    private DebugTrace dbg = null;
+
     public AirbrakeSimulationListener(final AirbrakeConfig cfg, final Rocket rkt) {
         this.config = Objects.requireNonNull(cfg, "AirbrakeConfig must not be null");
         this.rocket = rkt;
@@ -91,6 +96,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.debug("[Airbrakes] Could not retrieve rocket from simulation status");
         }
 
+        // Initialize debug tracing
+        setupDebug(config, tryGetSimName(status));
+
         // Load aero tables
         try {
             log.debug("[Airbrakes] Loading aerodynamics data from: {}", config.getCfdDataFilePath());
@@ -103,6 +111,24 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         // Predictor (defaults with robust convergence)
         this.predictor = new com.airbrakesplugin.util.ApogeePredictor();
+        // Wire predictor trace sink when requested
+        try {
+            if (config != null && config.isDebugEnabled() && config.isDbgTracePredictor()) {
+                if (dbg != null) {
+                    predictor.setTraceSink((tt, alt, vz, az, apStrict, apBest, unc, packets, note) -> {
+                        try {
+                            dbg.addPredictor(new DebugTrace.PredictorSample(tt, alt, vz, az, apStrict, apBest, unc, packets, note));
+                        } catch (Throwable ignore) { /* optional tracing */ }
+                    });
+                } else {
+                    predictor.setTraceSink(null);
+                }
+            } else {
+                predictor.setTraceSink(null);
+            }
+        } catch (Throwable t) {
+            log.debug("[Airbrakes] Predictor trace wiring skipped/unavailable: {}", t.toString());
+        }
 
         // Controller (flexible gate: strict if converged; best-effort after min window)
         final double target = safeTargetApogee(config);
@@ -505,5 +531,52 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             sb.append(String.format("%.3f", a[i]));
         }
         return sb.append("]").toString();
+    }
+
+    // -------------------- Debug helpers added --------------------
+
+    // At sim start (e.g., initialize / pre-sim hook)
+    private void setupDebug(final AirbrakeConfig cfg, final String simName) {
+        try {
+            if (cfg != null && cfg.isDebugEnabled()) {
+                final String tag = (simName == null || simName.isBlank()) ? "sim" : simName.replaceAll("\\W+","_");
+                dbg = new DebugTrace(
+                        true,
+                        cfg.isDbgWriteCsv(),
+                        cfg.isDbgShowConsole(),
+                        cfg.getDbgCsvDir(),
+                        tag
+                );
+                dbg.note("DebugTrace initialized");
+            } else {
+                dbg = new DebugTrace(false, false, false, "", null); // no-op
+            }
+        } catch (Throwable t) {
+            // If DebugTrace is unavailable at runtime, keep going without it.
+            dbg = null;
+            log.debug("[Airbrakes] DebugTrace setup skipped/unavailable: {}", t.toString());
+        }
+    }
+
+    // Try to extract a human-readable simulation name via reflection (best effort)
+    private static String tryGetSimName(final SimulationStatus status) {
+        if (status == null) return null;
+        try {
+            Method m = status.getClass().getMethod("getSimulationName");
+            Object v = m.invoke(status);
+            if (v != null) return v.toString();
+        } catch (Throwable ignore) { }
+        try {
+            Method m = status.getClass().getMethod("getSimulation");
+            Object simObj = m.invoke(status);
+            if (simObj != null) {
+                try {
+                    Method m2 = simObj.getClass().getMethod("getName");
+                    Object v = m2.invoke(simObj);
+                    if (v != null) return v.toString();
+                } catch (Throwable ignore2) { }
+            }
+        } catch (Throwable ignore) { }
+        return null;
     }
 }

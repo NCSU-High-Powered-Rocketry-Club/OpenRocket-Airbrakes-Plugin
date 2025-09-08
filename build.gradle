@@ -70,27 +70,60 @@ configurations.all {
     }
 }
 
-// Update Java version settings to 17
+// Use JDK 24 locally, but emit Java 17 bytecode for MAIN (plugin)
 java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(24)
+    }
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
-    
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
-    }
 }
 
-tasks.withType(JavaCompile).configureEach {
+// Main plugin compiled with JDK 17 and --release 17
+tasks.named('compileJava') {
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(17) }
     options.release = 17
+    options.encoding = 'UTF-8'
 }
 
-tasks.withType(Test).configureEach {
+// Tests can use JDK 24
+tasks.named('compileTestJava') {
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(24) }
+    options.encoding = 'UTF-8'
+}
+tasks.named('test') {
     useJUnitPlatform()
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(24) }
     jvmArgs += ['-Dnet.bytebuddy.experimental=true']
 }
 
-shadowJar {
+// Produce a thin plugin jar for OpenRocket
+jar {
     archiveBaseName.set('AirbrakePlugin')
     archiveClassifier.set('')
-    archiveVersion.set(project.version.toString())
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
+
+// Keep shadow for local debugging only (do NOT drop this in OpenRocket plugins)
+shadowJar {
+    archiveBaseName.set('AirbrakePlugin')
+    archiveClassifier.set('all')
+    exclude 'org/slf4j/impl/**'
+}
+
+// Sanity check: ensure main classes are Java 17 compatible
+tasks.register('verifyMainIsJ17') {
+    dependsOn 'classes'
+    doLast {
+        def cf = fileTree("${buildDir}/classes/java/main").matching { include '**/*.class' }
+        cf.each { f ->
+            def p = ["javap","-verbose", f.absolutePath].execute()
+            def out = new StringBuffer(); p.waitForProcessOutput(out, System.err)
+            def m = (out =~ /major version: (\d+)/)
+            if (m.find() && m.group(1).toInteger() > 61)
+                throw new GradleException("Class ${f.name} compiled > Java 17 (major ${m.group(1)})")
+        }
+        println "OK: main classes are Java 17 compatible."
+    }
+}
+compileJava.finalizedBy 'verifyMainIsJ17'
