@@ -49,7 +49,7 @@ public class AirbrakeConfig {
     public AirbrakeConfig() {
         this.referenceArea = 0.0;            // m²
         this.referenceLength = 0.0;          // m
-        this.maxDeploymentRate = 4.0;        // 1/s (fraction per second)
+        this.maxDeploymentRate = 40.0;        // 1/s (fraction per second)
         this.targetApogee = 0.0;           // m AGL
         this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
         this.maxMachForDeployment = 1.0;     // cap for supersonic

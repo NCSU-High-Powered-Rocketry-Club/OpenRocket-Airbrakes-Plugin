@@ -5,6 +5,8 @@ import info.openrocket.core.simulation.SimulationStatus;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -12,16 +14,80 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Comprehensive, no-Mockito test suite for AirbrakeController.
- * Uses a lightweight subclass (FakeStatus) instead of dynamic proxies.
- * Each test prints a short summary to stdout to aid debugging.
+ * Uses a lightweight reflection shim (StatusShim) to drive SimulationStatus time.
  */
 public class AirbrakeControllerTest {
 
-    /** Minimal status that lets us control simulation time. */
-    private static final class FakeStatus extends SimulationStatus {
-        private double now = 0.0;
-        public void setNow(double t) { this.now = t; }
-        @Override public double getSimulationTime() { return now; }
+    /** Reflection shim around a real SimulationStatus instance. */
+    private static final class StatusShim {
+        private final SimulationStatus delegate;
+        private final Method setTimeMethod;   // setSimulationTime(double) if present
+        private final Method getTimeMethod;   // getSimulationTime()
+        private final Field  timeField;       // fallback private field if no setter
+
+        StatusShim() {
+            this.delegate = allocateStatusWithoutCtor();
+            this.setTimeMethod = findMethod("setSimulationTime", double.class);
+            this.getTimeMethod = findMethod("getSimulationTime");
+            this.timeField = (this.setTimeMethod == null) ? findTimeField() : null;
+        }
+
+        SimulationStatus asStatus() { return delegate; }
+
+        void setNow(double t) {
+            try {
+                if (setTimeMethod != null) {
+                    setTimeMethod.invoke(delegate, t);
+                } else if (timeField != null) {
+                    timeField.setDouble(delegate, t);
+                } else {
+                    throw new IllegalStateException("No way to set SimulationStatus time");
+                }
+            } catch (ReflectiveOperationException e) {
+                throw new RuntimeException("Failed to set SimulationStatus time", e);
+            }
+        }
+
+        double getNow() {
+            try {
+                Object r = (getTimeMethod != null) ? getTimeMethod.invoke(delegate)
+                                                    : (timeField != null ? timeField.getDouble(delegate) : Double.NaN);
+                return (r instanceof Number) ? ((Number) r).doubleValue() : Double.NaN;
+            } catch (ReflectiveOperationException e) {
+                return Double.NaN;
+            }
+        }
+
+        // ---- reflection helpers ----
+        private static SimulationStatus allocateStatusWithoutCtor() {
+            try {
+                Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+                f.setAccessible(true);
+                sun.misc.Unsafe u = (sun.misc.Unsafe) f.get(null);
+                return (SimulationStatus) u.allocateInstance(SimulationStatus.class);
+            } catch (Throwable ex) {
+                throw new RuntimeException(
+                        "Cannot allocate SimulationStatus without constructor. " +
+                        "If this is blocked on your JDK, change the shim to call a visible super(...) instead.", ex);
+            }
+        }
+        private static Method findMethod(String name, Class<?>... args) {
+            try { return SimulationStatus.class.getMethod(name, args); }
+            catch (NoSuchMethodException e) { return null; }
+        }
+        private static Field findTimeField() {
+            String[] names = {"simulationTime","time","t"};
+            for (String n : names) {
+                try {
+                    Field f = SimulationStatus.class.getDeclaredField(n);
+                    if (f.getType() == double.class) { f.setAccessible(true); return f; }
+                } catch (NoSuchFieldException ignored) {}
+            }
+            for (Field f : SimulationStatus.class.getDeclaredFields()) {
+                if (f.getType() == double.class) { f.setAccessible(true); return f; }
+            }
+            return null;
+        }
     }
 
     /** Control context that records commands and timestamps. */
@@ -33,18 +99,15 @@ public class AirbrakeControllerTest {
         }
         final List<Event> events = new ArrayList<>();
         volatile boolean extended, retracted, switched;
+        void record(double t, boolean extend) { events.add(new Event(t, extend)); }
 
         @Override public void extend_airbrakes()  { extended = true;  retracted = false; }
         @Override public void retract_airbrakes() { retracted = true; extended = false; }
         @Override public void switch_altitude_back_to_pressure() { switched = true; }
-
-        void record(double t, boolean extend) { events.add(new Event(t, extend)); }
     }
 
     // ---------- Simple ballistic “coast” helper ----------
-
     private static final double g = 9.80665;
-
     private static void stepBallistic(ApogeePredictor pred, double dt, double[] alt, double[] vz) {
         final double aIncG = -g;             // up-positive accel including g
         pred.update(aIncG, dt, alt[0], vz[0]);
@@ -73,7 +136,7 @@ public class AirbrakeControllerTest {
 
     /** Run a simple ballistic coast up to tEnd, calling the controller every step. */
     private static RunResult runCoast(AirbrakeController ctl, ApogeePredictor pred,
-                                      FakeStatus status, double tEnd, double dt,
+                                      StatusShim shim, double tEnd, double dt,
                                       double alt0, double vz0, Ctx ctx) {
         double t = 0.0;
         double[] alt = new double[]{alt0};
@@ -87,13 +150,12 @@ public class AirbrakeControllerTest {
         while (t <= tEnd && vz[0] > -1.0) { // run a bit past apogee
             stepBallistic(pred, dt, alt, vz);
             t += dt;
-            status.setNow(t);
+            shim.setNow(t);
 
-            boolean acted = ctl.updateAndGateFlexible(status);
-            // Record events on state changes
+            boolean acted = ctl.updateAndGateFlexible(shim.asStatus());
             if (acted) {
                 commands++;
-                boolean nowExtended = isExtended(ctl, ctx); // based on ctx flags
+                boolean nowExtended = ctx.extended && !ctx.retracted;
                 if (nowExtended != lastExtended) {
                     ctx.record(t, nowExtended);
                     lastExtended = nowExtended;
@@ -111,16 +173,11 @@ public class AirbrakeControllerTest {
         );
     }
 
-    private static boolean isExtended(AirbrakeController ctl, Ctx ctx) {
-        // Controller only ever leaves one of these true.
-        return ctx.extended && !ctx.retracted;
-    }
-
     // ======================== TESTS ========================
 
     @Test @DisplayName("Above-target: extend using best-effort, then confirm with strict")
     public void testExtendWhenAboveTarget_BEThenStrict() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
         AirbrakeController ctl = new AirbrakeController(550.0, pred, ctx, 0.5, 5.0);
@@ -136,7 +193,7 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("Below-target: retract and never extend")
     public void testRetractWhenBelowTarget() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
         AirbrakeController ctl = new AirbrakeController(200.0, pred, ctx, 0.5, 5.0); // target above reachable
@@ -150,12 +207,12 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("No samples yet: controller must hold (no action)")
     public void testNoSamples_NoAction() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
         AirbrakeController ctl = new AirbrakeController(500.0, pred, ctx, 0.5, 5.0);
 
-        boolean acted = ctl.updateAndGateFlexible(status);
+        boolean acted = ctl.updateAndGateFlexible(status.asStatus());
         System.out.println("[NoSamples] acted=" + acted);
         assertFalse(acted, "Controller should not act when predictor has zero samples.");
         assertFalse(ctx.extended || ctx.retracted, "No command should be issued without samples.");
@@ -163,7 +220,7 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("Best-effort is gated by minCoastSeconds")
     public void testBestEffortGatedByMinCoast() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
         double minCoast = 1.0;
@@ -174,8 +231,8 @@ public class AirbrakeControllerTest {
         for (int i=0; i<50; i++) {
             stepBallistic(pred, 0.01, alt, vz);
             status.setNow((i+1)*0.01);
-            boolean acted = ctl.updateAndGateFlexible(status);
-            if (acted) System.out.println("[BestEffortGated] Unexpected action at t=" + status.getSimulationTime());
+            boolean acted = ctl.updateAndGateFlexible(status.asStatus());
+            if (acted) System.out.println("[BestEffortGated] Unexpected action at t=" + status.getNow());
             assertFalse(acted, "Controller should not act on BEST-EFFORT before minCoastSeconds elapses.");
         }
         System.out.println("[BestEffortGated] Passed with no actions before minCoast=" + minCoast + " s.");
@@ -183,7 +240,7 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("Command de-duplication: multiple calls, one command until sign flips")
     public void testCommandDeduplication() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
         AirbrakeController ctl = new AirbrakeController(550.0, pred, ctx, 0.2, 10.0);
@@ -196,17 +253,16 @@ public class AirbrakeControllerTest {
         for (int i=0; i<300; i++) {
             stepBallistic(pred, 0.01, alt, vz);
             status.setNow((i+1)*0.01);
-            boolean acted = ctl.updateAndGateFlexible(status);
+            boolean acted = ctl.updateAndGateFlexible(status.asStatus());
             if (acted) actedCount++;
-            if (actedCount > 0 && i > 20) break; // we have initial command, stop soon after
+            if (actedCount > 0 && i > 20) break;
         }
 
-        // More steps with no sign flip expected yet: should not issue repeated commands
         int actedAfter = 0;
         for (int i=0; i<200; i++) {
             stepBallistic(pred, 0.01, alt, vz);
-            status.setNow(status.getSimulationTime() + 0.01);
-            boolean acted = ctl.updateAndGateFlexible(status);
+            status.setNow(status.getNow() + 0.01);
+            boolean acted = ctl.updateAndGateFlexible(status.asStatus());
             if (acted) actedAfter++;
         }
 
@@ -217,11 +273,10 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("Deadband: within +deadband of target => retract (one-sided threshold)")
     public void testDeadbandOneSided() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         Ctx ctx = new Ctx();
         ApogeePredictor pred = new ApogeePredictor();
 
-        // Build an early best-effort apogee, then set target close to it
         double[] alt = new double[]{300.0};
         double[] vz  = new double[]{70.0};
         Double apBE = null;
@@ -234,9 +289,9 @@ public class AirbrakeControllerTest {
         double target = apBE;
 
         AirbrakeController ctl = new AirbrakeController(target, pred, ctx, 0.0, 10.0);
-        ctl.setApogeeDeadbandMeters(25.0); // extend only if ap > target + 25
+        ctl.setApogeeDeadbandMeters(25.0);
 
-        boolean acted = ctl.updateAndGateFlexible(status);
+        boolean acted = ctl.updateAndGateFlexible(status.asStatus());
         System.out.println("[Deadband] target=" + target + " apBE=" + apBE + " acted=" + acted + " events=" + ctx.events);
         assertTrue(acted, "Controller should issue an initial command.");
         assertTrue(ctx.retracted && !ctx.extended, "Within deadband the controller retracts (one-sided threshold).");
@@ -244,7 +299,7 @@ public class AirbrakeControllerTest {
 
     @Test @DisplayName("Null context: state toggles still occur without NPE")
     public void testNullContext_NoNPE() {
-        FakeStatus status = new FakeStatus();
+        StatusShim status = new StatusShim();
         ApogeePredictor pred = new ApogeePredictor();
         AirbrakeController ctl = new AirbrakeController(550.0, pred, null, 0.2, 10.0);
 
@@ -255,7 +310,7 @@ public class AirbrakeControllerTest {
         for (int i=0; i<400; i++) {
             stepBallistic(pred, 0.01, alt, vz);
             status.setNow((i+1)*0.01);
-            if (ctl.updateAndGateFlexible(status)) {
+            if (ctl.updateAndGateFlexible(status.asStatus())) {
                 acted++;
                 break;
             }

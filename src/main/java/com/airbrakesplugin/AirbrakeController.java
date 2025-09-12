@@ -6,215 +6,224 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * AirbrakeController (bang-bang + hysteresis + flexible gating)
+ * AirbrakeController — bang-bang with symmetric hysteresis, strict-first gating,
+ * and a persistent "current setpoint" the listener can poll every tick.
  *
- * Gate:
- *  - STRICT (converged) prediction always takes precedence if available.
- *  - Otherwise, after a minimum coast window has elapsed (latched when the first
- *    BEST-EFFORT apogee appears), act on BEST-EFFORT.
- *  - If neither is available, do nothing.
+ * Policy:
+ *  - STRICT (converged) apogee wins whenever available.
+ *  - Otherwise, after minCoastSeconds since COAST START, use BEST-EFFORT.
+ *  - If neither is usable, hold (no update).
  *
- * Commands:
- *  - EXTEND when predicted apogee above target (with hysteresis).
- *  - RETRACT when predicted apogee below target (with hysteresis).
+ * Hysteresis (deadband = ±db around target):
+ *  - First decision:  EXTEND only if err > +db, else RETRACT.
+ *  - EXTENDED   ->    RETRACT only if err < -db.
+ *  - RETRACTED  ->    EXTEND  as soon as err ≥ 0   (earlier re-extend to cut overshoot).
  *
- * Deadband:
- *  - Uses symmetric hysteresis: retracted→extend only if err > +DB; extended→retract only if err < −DB.
- *
- * Return value:
- *  - updateAndGateFlexible(...) returns true ONLY when a new command is issued on this call.
+ * Returns: updateAndGateFlexible(...) is true only if a NEW edge was issued this call.
+ * Additionally, caller can read currentSetpoint() every tick to drive the actuator.
  */
 public final class AirbrakeController {
 
     public interface ControlContext {
         void extend_airbrakes();
         void retract_airbrakes();
-        void switch_altitude_back_to_pressure(); // optional, left to caller
+        default void switch_altitude_back_to_pressure() {} // optional; noop by default
     }
 
-    // Optional debug listener to observe commanded deployment decisions.
     public interface DebugListener {
         void addController(double timeSeconds, double u, String reason);
     }
 
     private static final Logger log = LoggerFactory.getLogger(AirbrakeController.class);
 
-    // --- Config ---
+    // ---- Config ----
     private final double targetApogeeMeters;
     private final ApogeePredictor predictor;
     private ControlContext context;
-    private DebugListener dbg; // optional
+    private DebugListener dbg;
 
-    // Coast gating windows (seconds)
     private final double minCoastSeconds;
-    private final double maxCoastSeconds; // used for diagnostics; not a hard gate
+    private final double maxCoastSeconds;   // kept for logging/compatibility
+    private double deadband;                // meters
 
-    // Symmetric deadband half-width around target (meters) for hysteresis
-    private double apogeeDeadbandMeters = 0.0;
+    // Optional: prevent chatter from rapid target crossings
+    private double minFlipIntervalSec = 0.0;
 
-    // --- Internal state ---
-    private Double gateStartTime = null;   // when BEST-EFFORT first became available
-    private Boolean lastExtended = null;   // null=no command yet; true=extended; false=retracted
-    private Boolean lastUsingStrict = null;
+    // ---- State ----
+    private Double coastStartTime = null;   // COAST start anchor
+    private Boolean lastExtended   = null;  // null=unknown; true=extended; false=retracted
+    private double lastFlipTimeSec = Double.NEGATIVE_INFINITY;
+
+    // Persistent setpoint (what the listener should head toward each tick)
+    private boolean hasSetpoint = false;
+    private double currentSetpointU = 0.0;  // 0=retract, 1=extend
 
     // ----------------- Constructors -----------------
-
-    /** Backward-compatible ctor (no explicit windows). */
     public AirbrakeController(double targetApogeeMeters,
                               ApogeePredictor predictor,
                               ControlContext context) {
-        this(targetApogeeMeters, predictor, context, 2.0, 5.0);
+        this(targetApogeeMeters, predictor, context, 2.0, 5.0, 0.0);
     }
 
-    /** Preferred ctor with coast windows. */
     public AirbrakeController(double targetApogeeMeters,
                               ApogeePredictor predictor,
                               ControlContext context,
                               double minCoastSeconds,
                               double maxCoastSeconds) {
+        this(targetApogeeMeters, predictor, context, minCoastSeconds, maxCoastSeconds, 0.0);
+    }
+
+    public AirbrakeController(double targetApogeeMeters,
+                              ApogeePredictor predictor,
+                              ControlContext context,
+                              double minCoastSeconds,
+                              double maxCoastSeconds,
+                              double deadbandMeters) {
         this.targetApogeeMeters = targetApogeeMeters;
         this.predictor = predictor;
         this.context = context;
         this.minCoastSeconds = Math.max(0.0, minCoastSeconds);
         this.maxCoastSeconds = Math.max(this.minCoastSeconds, maxCoastSeconds);
+        this.deadband = Math.max(0.0, deadbandMeters);
     }
 
     // ----------------- API -----------------
-
     public void setContext(ControlContext ctx) { this.context = ctx; }
     public void setDebugListener(DebugListener dbg) { this.dbg = dbg; }
-
     public double getTargetApogeeMeters() { return targetApogeeMeters; }
+    public double getDeadbandMeters() { return deadband; }
+    public void setApogeeDeadbandMeters(double meters) { this.deadband = Math.max(0.0, meters); }
+    public void setMinFlipIntervalSec(double s) { this.minFlipIntervalSec = Math.max(0.0, s); }
 
-    /** Optional tweak: adjust the symmetric deadband (+/−meters) around target. */
-    public void setApogeeDeadbandMeters(double meters) {
-        this.apogeeDeadbandMeters = Math.max(0.0, meters);
-    }
+    /** Persistent setpoint (0=retract, 1=extend). Valid once we've made a first decision. */
+    public boolean hasSetpoint() { return hasSetpoint; }
+    public double currentSetpoint() { return currentSetpointU; }
+    public Boolean lastExtendedState() { return lastExtended; }
 
-    /** Call at simulation start to clear internal latches between runs. */
     public void reset() {
-        gateStartTime = null;
+        coastStartTime = null;
         lastExtended = null;
-        lastUsingStrict = null;
+        lastFlipTimeSec = Double.NEGATIVE_INFINITY;
+        hasSetpoint = false;
+        currentSetpointU = 0.0;
     }
+
+    /** Prefer the listener to call this exactly at coast start. */
+    public void notifyCoastLatched(double tSeconds) {
+        if (coastStartTime == null) {
+            coastStartTime = tSeconds;
+            log.debug("[Controller] t={}s: COAST start latched (anchor set)", fmt(tSeconds));
+        }
+    }
+    public void notifyCoastLatched(SimulationStatus status) { notifyCoastLatched(safeTime(status)); }
 
     /**
      * Decide and (if needed) issue a new command.
-     * @return true if a new command was issued in THIS call, false otherwise.
+     * @return true if a NEW edge (extend or retract) was issued in THIS call.
      */
     public boolean updateAndGateFlexible(SimulationStatus status) {
         if (predictor == null) return false;
 
         final double t = safeTime(status);
 
-        // Latch gate start when a best-effort apogee FIRST becomes available.
-        // (This aligns the "minCoastSeconds" window with the earliest usable estimate.)
-        if (gateStartTime == null) {
-            final Double probe = predictor.getApogeeBestEffort();
-            if (probe != null && Double.isFinite(probe)) {
-                gateStartTime = t;
-                log.debug("[Controller] t={}s: best-effort apogee appeared; gate window starts", fmt(t));
-            }
-            // If you prefer the old behavior based on predictor.sampleCount():
-            // if (gateStartTime == null && predictor.sampleCount() > 0) { gateStartTime = t; ... }
+        // If no explicit anchor, infer coast when first samples arrive (fallback).
+        if (coastStartTime == null && predictor.sampleCount() > 0) {
+            coastStartTime = t;
+            log.debug("[Controller] t={}s: inferred COAST anchor from first samples", fmt(t));
         }
+        final double elapsed = (coastStartTime == null) ? 0.0 : Math.max(0.0, t - coastStartTime);
 
-        final double elapsed = (gateStartTime == null) ? 0.0 : Math.max(0.0, t - gateStartTime);
-
-        // STRICT (converged) prediction if available
+        // STRICT has precedence; otherwise gate BEST-EFFORT on min coast time.
         final Double apStrict = predictor.getPredictionIfReady();
-
-        // BEST-EFFORT allowed only after min window
-        Double apBestEffort = null;
-        if (apStrict == null && elapsed >= minCoastSeconds) {
-            apBestEffort = predictor.getApogeeBestEffort();
-        }
-
-        final boolean usingStrict = (apStrict != null);
-        final Double ap = usingStrict ? apStrict : apBestEffort;
+        final Double ap = (apStrict != null)
+                ? apStrict
+                : (elapsed >= minCoastSeconds ? predictor.getApogeeBestEffort() : null);
 
         if (ap == null || !Double.isFinite(ap)) {
-            // Not ready to act
-            if (gateStartTime != null && elapsed > maxCoastSeconds) {
-                log.debug("[Controller] t={}s: >{}s since gate start; still no STRICT. Holding on best-effort only when window permits.",
-                        fmt(t), fmt(maxCoastSeconds));
-            } else {
-                log.debug("[Controller] t={}s: no usable apogee yet (elapsed={}s, min={}s) — holding",
+            if (coastStartTime == null) {
+                log.debug("[Controller] t={}s: no usable apogee (no coast anchor yet) — holding", fmt(t));
+            } else if (elapsed < minCoastSeconds) {
+                log.debug("[Controller] t={}s: gating BEST-EFFORT (elapsed={}s < min={}s) — holding",
                         fmt(t), fmt(elapsed), fmt(minCoastSeconds));
+            } else {
+                log.debug("[Controller] t={}s: >={}s since coast; still no usable apogee — holding",
+                        fmt(t), fmt(minCoastSeconds));
             }
+            // Do not change setpoint here; listener keeps ramping toward whatever it last knew.
             return false;
         }
 
-        // Optional diagnostic if mode flips
-        if (lastUsingStrict == null || lastUsingStrict != usingStrict) {
-            log.debug("[Controller] t={}s: mode -> {}", fmt(t), usingStrict ? "STRICT" : "BEST-EFFORT");
-            lastUsingStrict = usingStrict;
-        }
-
-        // Decision with symmetric hysteresis around target
+        // Error relative to target
         final double err = ap - targetApogeeMeters;
-        final double db = apogeeDeadbandMeters;
 
-        // Debug hook mirroring "getCommandedDeployment" style
-        // Example:
-        // if (/* under target beyond deadband */) { double u = 0.0; return u; }
-        // if (/* over target beyond deadband */)  { double u = 1.0; return u; }
-        // // within deadband
-        // return lastCmd;
+        // Decide desired "extended?" using improved hysteresis
+        boolean wantExtended = decideNext(t, lastExtended, err, deadband, minFlipIntervalSec, lastFlipTimeSec);
+
+        // Update persistent setpoint (what the listener will head toward every tick)
+        hasSetpoint = true;
+        currentSetpointU = wantExtended ? 1.0 : 0.0;
+
+        // Optional debug hook for plotting/controller UI
         if (dbg != null) {
-            double lastCmd = (lastExtended != null && lastExtended) ? 1.0 : 0.0;
-            if (err < -db) {
-                double u = 0.0; // retract
-                dbg.addController(t, u, "under-target");
-            } else if (err > db) {
-                double u = 1.0; // extend
-                dbg.addController(t, u, "over-target");
-            } else {
-                double u = lastCmd; // within deadband, hold
-                dbg.addController(t, u, "deadband-hold");
-            }
+            double u; String why;
+            if      (err >  deadband) { u = 1.0; why = "over-target"; }
+            else if (err < -deadband) { u = 0.0; why = "under-target"; }
+            else if (wantExtended)    { u = 1.0; why = "deadband-hold-EXT"; }
+            else                      { u = 0.0; why = "deadband-hold-RET"; }
+            dbg.addController(t, u, why);
         }
 
-        boolean nextExtended;
-        if (lastExtended == null) {
-            // First decision: choose based on center + one-sided threshold (extend only if clearly above)
-            nextExtended = (err > db);
-        } else if (lastExtended) {
-            // Currently EXTENDED: only retract if we are clearly below target band
-            nextExtended = !(err < -db);
-        } else {
-            // Currently RETRACTED: only extend if we are clearly above target band
-            nextExtended = (err > db);
-        }
-
-        // Only issue a command if the state changes
-        if (lastExtended == null || lastExtended != nextExtended) {
-            lastExtended = nextExtended;
+        // Emit edge only if state changes
+        if (lastExtended == null || !lastExtended.equals(wantExtended)) {
+            lastExtended = wantExtended;
+            lastFlipTimeSec = t;
             if (context != null) {
-                if (nextExtended) {
+                if (wantExtended) {
                     context.extend_airbrakes();
-                    log.info("[Controller] t={}s: {} apogee={} -> EXTEND (target={}, err={}, db=±{})",
-                            fmt(t), usingStrict ? "STRICT" : "BEST-EFFORT", fmt(ap),
-                            fmt(targetApogeeMeters), fmt(err), fmt(db));
+                    log.info("[Controller] t={}s: apogee={} -> EXTEND (target={}, err={}, db=±{})",
+                            fmt(t), fmt(ap), fmt(targetApogeeMeters), fmt(err), fmt(deadband));
                 } else {
                     context.retract_airbrakes();
-                    log.info("[Controller] t={}s: {} apogee={} -> RETRACT (target={}, err={}, db=±{})",
-                            fmt(t), usingStrict ? "STRICT" : "BEST-EFFORT", fmt(ap),
-                            fmt(targetApogeeMeters), fmt(err), fmt(db));
+                    log.info("[Controller] t={}s: apogee={} -> RETRACT (target={}, err={}, db=±{})",
+                            fmt(t), fmt(ap), fmt(targetApogeeMeters), fmt(err), fmt(deadband));
                 }
-                // Optional: context.switch_altitude_back_to_pressure();
             }
-            return true; // acted this call
+            return true;
         }
 
-        // Command unchanged this tick
-        log.debug("[Controller] t={}s: {} apogee={} (target={}, err={}, db=±{}) — no change",
-                fmt(t), usingStrict ? "STRICT" : "BEST-EFFORT", fmt(ap),
-                fmt(targetApogeeMeters), fmt(err), fmt(db));
+        log.debug("[Controller] t={}s: apogee={} (target={}, err={}, db=±{}) — no change",
+                fmt(t), fmt(ap), fmt(targetApogeeMeters), fmt(err), fmt(deadband));
         return false;
     }
 
     // ----------------- Helpers -----------------
+
+    /** Improved hysteresis: early re-extend on target crossing; optional dwell between flips. */
+    private static boolean decideNext(double tNow,
+                                      Boolean lastExtended,
+                                      double err,
+                                      double db,
+                                      double minFlipInterval,
+                                      double lastFlipTimeSec) {
+        // Honor dwell window if requested
+        if (minFlipInterval > 0.0 && lastFlipTimeSec > 0.0) {
+            double since = tNow - lastFlipTimeSec;
+            if (since < minFlipInterval && lastExtended != null) {
+                return lastExtended;
+            }
+        }
+
+        if (lastExtended == null) {
+            // First decision: conservative — require clear overshoot to start extending
+            return err > db;
+        }
+        if (lastExtended) {
+            // Currently EXTENDED: only retract if clearly below the band
+            return !(err < -db);
+        }
+        // Currently RETRACTED: re-extend promptly once we cross the target
+        return (err >= 0.0);
+    }
 
     private static double safeTime(SimulationStatus status) {
         try {
