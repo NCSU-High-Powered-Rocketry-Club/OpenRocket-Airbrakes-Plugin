@@ -1,320 +1,239 @@
 package com.airbrakesplugin;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.airbrakesplugin.util.AirDensity;
 import com.airbrakesplugin.util.ApogeePredictor;
-import com.airbrakesplugin.util.DebugTrace;
-
 import info.openrocket.core.aerodynamics.AerodynamicForces;
-import info.openrocket.core.rocketcomponent.Rocket;
+import info.openrocket.core.aerodynamics.FlightConditions;
+import info.openrocket.core.simulation.FlightDataBranch;
 import info.openrocket.core.simulation.FlightDataType;
 import info.openrocket.core.simulation.SimulationStatus;
 import info.openrocket.core.simulation.exception.SimulationException;
 import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
 import info.openrocket.core.util.Coordinate;
-
-import java.lang.reflect.Method;
-import java.util.Objects;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * AirbrakeSimulationListener — coefficient injection of ΔCd (and ΔCm)
- * plus robust actuator/command integration.
+ * Waterloo-style listener: controller+predictor loop and CDAxial override.
+ * Uses FlightDataType setValue/getLast (falls back to in-memory if custom types unavailable).
  */
 public final class AirbrakeSimulationListener extends AbstractSimulationListener {
 
     private static final Logger log = LoggerFactory.getLogger(AirbrakeSimulationListener.class);
 
-    // ---- config & sim objects ------------------------------------------------
-    private final AirbrakeConfig config;
-    private Rocket rocket;                // optional; not required for coeff updates
-    private SimulationStatus sim;
+    // ---- collaborators ----
+    private final AirbrakeAerodynamics airbrakes;   // provides getIncrementalCd(mach, ext) (0..1 ext)
+    private final AirbrakeController   controller;  // issues extend/retract via context
+    private final ApogeePredictor      predictor;   // world-Z accel (incl. g) → apogee
 
-    // ---- subsystems ----------------------------------------------------------
-    private AirbrakeAerodynamics aerodynamics;     // ΔCd(M, deploy), optional ΔCm
-    private ApogeePredictor      predictor;        // predictor (integrates accel incl. g)
-    private AirbrakeController   controller;       // bang-bang controller (flexible gate)
+    // ---- gates (configurable time, fixed vz as requested) -------------------
+    private final double extTimeGateS;              // apply brakes after this time (s)
+    private final double vzGateMps = 18.0;          // vertical speed gate (m/s)
 
-    // ---- geometry & limits (SI) ---------------------------------------------
-    private double Sref = 0.0;             // m²
-    private double Lref = 0.0;             // m
-    private double maxRate = 4.0;          // fraction/s (actuator slew)
+    // ---- One-shot LUT edge logs --------------------------------------------
+    private boolean loggedMachLowOnce  = false;
+    private boolean loggedMachHighOnce = false;
+    private boolean loggedExtClampOnce = false;
 
-    // ---- state ---------------------------------------------------------------
-    private double lastTime_s = 0.0;
-    private double deploy     = 0.0;       // physical actuator state [0..1]
-    private double commandedDeploy = 0.0;  // controller desired end-state (0 or 1)
-    private double currentAirbrakeDeployment = 0.0;
+    // ---- per-step cache ----
+    private FlightConditions flightConditions = null;
+    private double ext = 0.0;                       // commanded extension [0..1]
+    private double lastTime = Double.NaN;
+    private Double lastVz = null;
 
-    // Tracking for accel computation & coast gating
-    private Double lastVaxis = null;
-    private boolean coastLatched = false;
-    private int thrustZeroHits = 0;
-    private int accelGateHits  = 0;
+    // Fallback ref area if FlightConditions not yet available
+    private final double refAreaFallback;
 
-    // ---- coast detection thresholds -----------------------------------------
-    private static final double G = 9.80665;
-    private static final double THRUST_EPSILON_N     = 1.0;
-    private static final int    THRUST_CONSEC_HITS   = 2;
-    private static final double ACCEL_MINUS_G_THRESH = 1.5; // m/s^2
-    private static final int    ACCEL_CONSEC_HITS    = 2;
-    private static final double MIN_ASCEND_VZ        = 0.5; // m/s
+    // Custom columns (best-effort). If null, we skip writing/reading.
+    private static final FlightDataType AIRBRAKE_EXT =
+            createType("airbrakeExt", "airbrakeExt", "UNITS_RELATIVE");
+    private static final FlightDataType PRED_APOGEE =
+            createType("predictedApogee", "predictedApogee", "UNITS_DISTANCE");
 
-    // ---- Debug / instrumentation --------------------------------------------
-    private DebugTrace dbg = null;
-    private boolean firstDeployMoveLogged = false;
-
-    public AirbrakeSimulationListener(final AirbrakeConfig cfg, final Rocket rkt) {
-        this.config = Objects.requireNonNull(cfg, "AirbrakeConfig must not be null");
-        this.rocket = rkt;
-        log.debug("[Airbrakes] Listener created with config: {}", cfg);
+    public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes,
+                                      AirbrakeController controller,
+                                      ApogeePredictor predictor,
+                                      double extTimeGateSeconds,
+                                      double refAreaFallback) {
+        this.airbrakes = airbrakes;
+        this.controller = controller;
+        this.predictor = predictor;
+        this.extTimeGateS = extTimeGateSeconds;
+        this.refAreaFallback = refAreaFallback;
     }
 
-    public double getCurrentAirbrakeDeployment() { return currentAirbrakeDeployment; }
-    public boolean isAirbrakeCurrentlyDeployed() { return currentAirbrakeDeployment > 1e-6; }
+    // Controller callbacks: set current extension directly.
+    private final AirbrakeController.ControlContext ctx = new AirbrakeController.ControlContext() {
+        @Override public void extend_airbrakes()  { ext = 1.0; }
+        @Override public void retract_airbrakes() { ext = 0.0; }
+        @Override public void switch_altitude_back_to_pressure() { }
+    };
 
-    // ---- lifecycle: begin ----------------------------------------------------
     @Override
-    public void startSimulation(final SimulationStatus status) throws SimulationException {
-        this.sim = status;
-        log.debug("[Airbrakes] Simulation starting...");
+    public void startSimulation(SimulationStatus status) throws SimulationException {
+        ext = 0.0;
+        lastTime = status.getSimulationTime();
+        lastVz = null;
+        loggedMachLowOnce = loggedMachHighOnce = loggedExtClampOnce = false;
+
+        // If controller has a context setter, install ours; else assume ctor had it.
         try {
-            this.rocket = (Rocket) status.getClass().getMethod("getRocket").invoke(status);
-        } catch (Throwable ignore) {}
+            controller.getClass()
+                      .getDeclaredMethod("setContext", AirbrakeController.ControlContext.class)
+                      .invoke(controller, ctx);
+        } catch (Throwable ignored) {}
 
-        setupDebug(config, tryGetSimName(status));
-
-        try {
-            this.aerodynamics = new AirbrakeAerodynamics(config.getCfdDataFilePath());
-        } catch (Exception e) {
-            throw new SimulationException("Airbrake CFD data failed to load", e);
-        }
-
-        this.predictor = new com.airbrakesplugin.util.ApogeePredictor();
-        try {
-            if (config != null && config.isDebugEnabled() && config.isDbgTracePredictor()) {
-                if (dbg != null) {
-                    predictor.setTraceSink((tt, alt, vz, az, apStrict, apBest, unc, packets, note) -> {
-                        try { dbg.addPredictor(new DebugTrace.PredictorSample(tt, alt, vz, az, apStrict, apBest, unc, packets, note)); }
-                        catch (Throwable ignore) {}
-                    });
-                } else {
-                    predictor.setTraceSink(null);
-                }
-            } else {
-                predictor.setTraceSink(null);
-            }
-        } catch (Throwable t) { log.debug("[Airbrakes] Predictor trace wiring skipped: {}", t.toString()); }
-
-        final double target = safeTargetApogee(config);
-        this.commandedDeploy = 0.0;
-        this.controller = new AirbrakeController(target, predictor, new AirbrakeController.ControlContext() {
-            @Override public void extend_airbrakes() { commandedDeploy = 1.0; }
-            @Override public void retract_airbrakes() { commandedDeploy = 0.0; }
-            @Override public void switch_altitude_back_to_pressure() { }
-        }, .5, 5.0);
-
-        try {
-            Method m = config.getClass().getMethod("getApogeeToleranceMeters");
-            Object v = m.invoke(config);
-            if (v instanceof Number) controller.setApogeeDeadbandMeters(Math.max(0.0, ((Number) v).doubleValue()));
-        } catch (Throwable ignore) {}
-
-        Sref    = config.getReferenceArea();
-        Lref    = config.getReferenceLength();
-        maxRate = config.getMaxDeploymentRate();
-
-        deploy        = 0.0;
-        lastTime_s    = finiteOr(status.getSimulationTime(), 0.0);
-        lastVaxis     = null;
-        coastLatched  = false;
-        thrustZeroHits = 0;
-        accelGateHits  = 0;
-        firstDeployMoveLogged = false;
+        try { predictor.getClass().getMethod("reset").invoke(predictor); } catch (Throwable ignored) {}
     }
 
-    // ---- lifecycle: step state update (predictor, controller, actuator) -----
+    private boolean isExtensionAllowed(SimulationStatus status) {
+        final Coordinate v = status.getRocketVelocity();
+        final double vz = (v != null) ? v.z : 0.0;
+        return status.getSimulationTime() > extTimeGateS && vz > vzGateMps;
+    }
+
     @Override
-    public boolean preStep(final SimulationStatus status) {
-        if (aerodynamics == null || controller == null || predictor == null) return true;
+    public boolean preStep(SimulationStatus status) {
+        // time & kinematics
+        final double t  = status.getSimulationTime();
+        final double dt = Double.isFinite(lastTime) ? Math.max(1e-6, t - lastTime) : 1e-3;
+        lastTime = t;
 
-        final double t  = finiteOr(status.getSimulationTime(), lastTime_s);
-        final double dt = Math.max(0.0, t - lastTime_s);
-        lastTime_s = t;
-        if (dt <= 0.0) return true;
+        final Coordinate vel = status.getRocketVelocity();
+        final Coordinate pos = status.getRocketPosition();
+        final double vz = (vel != null) ? vel.z : 0.0;
+        final double z  = (pos != null) ? pos.z : 0.0;
 
-        final Coordinate vWorld = status.getRocketVelocity();
-        final double vAxis      = (vWorld != null) ? vWorld.z : 0.0;
-        final double alt        = safeGet(status, FlightDataType.TYPE_ALTITUDE, 0.0);
+        // predictor: world-Z accel including g via dv/dt
+        if (lastVz != null) {
+            final double a_worldZ_incl_g = (vz - lastVz) / dt;
+            predictor.update(a_worldZ_incl_g, dt, z, vz);
+        }
+        lastVz = vz;
 
-        double aNetAxis = Double.NaN;
-        if (lastVaxis != null) aNetAxis = (vAxis - lastVaxis) / Math.max(1e-6, dt);
-        lastVaxis = vAxis;
+        // controller (issues extend/retract via ctx)
+        try { controller.updateAndGateFlexible(status); } catch (Throwable ignored) {}
 
-        final double gAxis   = -G;
-        final double aMinusG = Double.isFinite(aNetAxis) ? (aNetAxis - gAxis) : Double.NaN;
-
-        boolean thrustGate = false, accelGate = false;
-        final double thrust = safeGet(status, FlightDataType.TYPE_THRUST_FORCE, Double.NaN);
-        if (Double.isFinite(thrust) && thrust <= THRUST_EPSILON_N) {
-            thrustZeroHits++; thrustGate = (thrustZeroHits >= THRUST_CONSEC_HITS);
-        } else thrustZeroHits = 0;
-
-        if (Double.isFinite(aMinusG) && aMinusG <= ACCEL_MINUS_G_THRESH) {
-            accelGateHits++; accelGate = (accelGateHits >= ACCEL_CONSEC_HITS);
-        } else accelGateHits = 0;
-
-        if (!coastLatched && (vAxis > MIN_ASCEND_VZ) && (thrustGate || accelGate)) {
-            coastLatched = true;
-            controller.notifyCoastLatched(status);
+        // write columns (best-effort)
+        final FlightDataBranch fdb = status.getFlightDataBranch();
+        if (AIRBRAKE_EXT != null) fdb.setValue(AIRBRAKE_EXT, ext);
+        if (PRED_APOGEE != null) {
+            Double aps = predictor.getPredictionIfReady();
+            Double apb = predictor.getApogeeBestEffort();
+            fdb.setValue(PRED_APOGEE, (aps != null) ? aps : (apb != null ? apb : Double.NaN));
         }
 
-        if (coastLatched && Double.isFinite(aNetAxis)) {
-            predictor.update(aNetAxis, dt, alt, vAxis);
-        }
-
-        try { controller.updateAndGateFlexible(status); } catch (Throwable ignore) {}
-
-        double beforeCmd = commandedDeploy;
-        if (hasMethod(controller, "hasSetpoint") && hasMethod(controller, "currentSetpoint")) {
-            try {
-                if ((boolean) controller.getClass().getMethod("hasSetpoint").invoke(controller)) {
-                    double u = (double) controller.getClass().getMethod("currentSetpoint").invoke(controller);
-                    commandedDeploy = clamp01(u);
-                }
-            } catch (Throwable ignore) {}
-        }
-
-        double effectiveSetpoint = commandedDeploy;
-        final double maxMach = Math.max(0.0, config.getMaxMachForDeployment());
-        final double machNow = safeGet(status, FlightDataType.TYPE_MACH_NUMBER, Double.NaN);
-        if (Double.isFinite(machNow) && machNow > maxMach && maxMach > 0.0) effectiveSetpoint = 0.0;
-
-        final double dmax = maxRate * dt;
-        final double delta = Math.max(-dmax, Math.min(dmax, effectiveSetpoint - deploy));
-        final double oldDeploy = deploy;
-        deploy = clamp01(deploy + delta);
-
-        currentAirbrakeDeployment = deploy;
-        tryEmitExtensionToFlightData(status, deploy);
         return true;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Waterloo-style override: set CDAxial from our airbrake drag (simple & fast)
-    // ─────────────────────────────────────────────────────────────────────────
+    @Override
+    public FlightConditions postFlightConditions(SimulationStatus status,
+                                                 FlightConditions fc) throws SimulationException {
+        this.flightConditions = fc;
+        return fc;
+    }
+
     @Override
     public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
-                                                        final AerodynamicForces forces) {
-        final double velocityZ = status.getRocketVelocity().z;
+                                                        final AerodynamicForces forces) throws SimulationException {
+        if (airbrakes == null || forces == null || status == null) return forces;
 
-        // Override CD only during coast and at valid speeds
-        if (isExtensionAllowed(status)) {
-            // airbrake extension (use listener state)
-            final double airbrakeExt = currentAirbrakeDeployment;
+        // Gate by time and vertical speed (Waterloo-style), and require some extension
+        if (!isExtensionAllowed(status)) return forces;
+        final double airbrakeExt = getLatestExtension(status);
+        if (!(airbrakeExt > 1e-6)) return forces;
 
-            // altitude (fallback to world-Z if site altitude unavailable)
-            double altitude;
+        // Velocity, altitude, Mach
+        final Coordinate v = status.getRocketVelocity();
+        final double v2 = (v != null) ? v.length2() : 0.0;
+        final double speed = Math.sqrt(Math.max(0.0, v2));
+
+        double altitude;
+        try {
+            altitude = status.getRocketPosition().z
+                    + status.getSimulationConditions().getLaunchSite().getAltitude();
+        } catch (Throwable t) {
+            altitude = status.getRocketPosition().z;
+        }
+
+        double mach = AirDensity.machFromV(speed, altitude);
+        if (!Double.isFinite(mach) || mach <= 0) {
             try {
-                altitude = status.getRocketPosition().z
-                        + status.getSimulationConditions().getLaunchSite().getAltitude();
-            } catch (Throwable t) {
-                altitude = status.getRocketPosition().z;
+                final double a = AirDensity.speedOfSoundISA(altitude);
+                if (a > 1e-6) mach = speed / a;
+            } catch (Throwable ignore) { mach = 0.0; }
+        }
+
+        // Atmospheric terms
+        final double rho = (flightConditions != null)
+                ? flightConditions.getAtmosphericConditions().getDensity()
+                : AirDensity.rhoForDynamicPressureFromV(altitude, speed);
+        final double dynP = 0.5 * rho * v2;
+        final double refArea = (flightConditions != null)
+                ? flightConditions.getRefArea()
+                : Math.max(1e-9, refAreaFallback);
+        if (!(dynP > 1e-6) || !(refArea > 0.0)) return forces;
+
+        // Clamp Mach/extension to LUT bounds if available; log once
+        Double machMinObj = tryGetDouble(airbrakes, "getMinMach", "getMachMin", "minMach", "getMachMinValue");
+        Double machMaxObj = tryGetDouble(airbrakes, "getMaxMach", "getMachMax", "maxMach", "getMachMaxValue");
+        double machMin = (machMinObj != null) ? machMinObj : Double.NaN;
+        double machMax = (machMaxObj != null) ? machMaxObj : Double.NaN;
+
+        double machClamped = mach;
+        if (Double.isFinite(machMin) && machClamped < machMin) {
+            if (!loggedMachLowOnce) {
+                log.debug("[Airbrakes] LUT edge: Mach {} below min {} — clamping",
+                        String.format("%.3f", machClamped), String.format("%.3f", machMin));
+                loggedMachLowOnce = true;
             }
+            machClamped = machMin;
+        }
+        if (Double.isFinite(machMax) && machClamped > machMax) {
+            if (!loggedMachHighOnce) {
+                log.debug("[Airbrakes] LUT edge: Mach {} above max {} — clamping",
+                        String.format("%.3f", machClamped), String.format("%.3f", machMax));
+                loggedMachHighOnce = true;
+            }
+            machClamped = machMax;
+        }
 
-            // ΔCd from LUT at current Mach/extension
-            final double v2 = status.getRocketVelocity().length2();
-            final double v  = Math.sqrt(Math.max(0.0, v2));
-            final double M  = AirDensity.machFromV(v, altitude);
-            final double dCd = aerodynamics.getIncrementalCd(M, airbrakeExt);
+        double extIn = airbrakeExt;
+        double extClamped = clamp01(extIn);
+        if (extClamped != extIn && !loggedExtClampOnce) {
+            log.debug("[Airbrakes] LUT edge: extension {} outside [0,1] — clamping to {}",
+                    String.format("%.3f", extIn), String.format("%.3f", extClamped));
+            loggedExtClampOnce = true;
+        }
 
-            // q (compressibility-aware) and reference area
-            final double rhoEff = AirDensity.rhoForDynamicPressureFromV(altitude, v);
-            final double dynP   = 0.5 * rhoEff * v2;
-            final double refA   = Math.max(1e-9, Sref);
+        // ΔCd from LUT → drag force; if your class exposes calculateDragForce, you can swap it in.
+        final double dCd = airbrakes.getIncrementalCd(machClamped, extClamped);
+        if (!Double.isFinite(dCd) || Math.abs(dCd) < 1e-12) return forces;
 
-            // Equivalent force then back to CDAxial; this equals dCd but mirrors the pattern
-            final double dragForce = dCd * dynP * refA;
-            final double cDAxial   = dragForce / dynP / refA;
+        final double dragForce = dCd * dynP * refArea;
+        final double cDAxial = dragForce / dynP / refArea; // equals dCd
 
-            // Set CDAxial (fall back across possible setter names)
-            trySetDouble(forces, cDAxial,
-                    "setCDAxial", "setAxialForceCoefficient", "setDragCoefficient", "setCD", "setCx");
+        // *** DEBUG: verify the override applied (as requested) ***
+        log.debug("[Airbrakes] CDAxial set: ext={} M={} dCd={} q={}Pa S={} -> CdAx={}",
+                String.format("%.2f", extClamped),
+                String.format("%.3f", machClamped),
+                String.format("%.5f", dCd),
+                String.format("%.1f", dynP),
+                String.format("%.3f", refArea),
+                String.format("%.5f", cDAxial));
+
+        // Set CDAxial (use common setter names)
+        if (!trySetDouble(forces, cDAxial, "setCDaxial", "setCDAxial", "setAxialForceCoefficient", "setDragCoefficient", "setCD")) {
+            log.debug("[Airbrakes] No CDAxial/drag-coefficient setter found on AerodynamicForces; leaving base unchanged.");
         }
         return forces;
     }
 
-    // Keep the class lean: no 3-arg variant and no aeroHammer path.
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
 
-    // ---- lifecycle: end -----------------------------------------------------
-    @Override
-    public void endSimulation(final SimulationStatus status, final SimulationException e) {
-        if (dbg != null) dbg.note("Simulation ended");
-    }
-
-    // ---- helpers ------------------------------------------------------------
-    private static boolean hasMethod(Object obj, String name) {
-        try { obj.getClass().getMethod(name); return true; }
-        catch (Throwable t) { return false; }
-    }
-
-    private static double clamp(double x, double lo, double hi) { return Math.min(Math.max(x, lo), hi); }
-    private static double clamp01(double x) { return clamp(x, 0.0, 1.0); }
-    private static double finiteOr(double x, double fb) { return Double.isFinite(x) ? x : fb; }
-
-    private static double safeGet(final SimulationStatus st, final FlightDataType type, final double fallback) {
-        try {
-            final double v = st.getFlightDataBranch().getLast(type);
-            return Double.isFinite(v) ? v : fallback;
-        } catch (Throwable ignore) { return fallback; }
-    }
-
-    private static double safeTargetApogee(AirbrakeConfig cfg) {
-        try {
-            Method m = cfg.getClass().getMethod("getTargetApogee");
-            Object v = m.invoke(cfg);
-            if (v instanceof Number) return ((Number) v).doubleValue();
-        } catch (Throwable ignore) { }
-        return 0.0;
-    }
-
-    /**
-     * Best-effort: write a user-visible "Airbrake Extension (%)".
-     */
-    private static void tryEmitExtensionToFlightData(final SimulationStatus st, final double deployFrac) {
-        try {
-            final Object branch = st.getFlightDataBranch();
-            final Class<?> c = branch.getClass();
-            for (String m : new String[]{"setUserData", "setCustomData", "putUserData"}) {
-                try {
-                    c.getMethod(m, String.class, double.class).invoke(branch, "Airbrake Extension (%)", deployFrac * 100.0);
-                    return;
-                } catch (NoSuchMethodException ignored) { }
-            }
-        } catch (Throwable ignore) { }
-    }
-
-    private static String tryGetSimName(final SimulationStatus status) {
-        if (status == null) return null;
-        try {
-            Method m = status.getClass().getMethod("getSimulationName");
-            Object v = m.invoke(status);
-            if (v != null) return v.toString();
-        } catch (Throwable ignore) { }
-        try {
-            Method m = status.getClass().getMethod("getSimulation");
-            Object simObj = m.invoke(status);
-            if (simObj != null) {
-                try {
-                    Method m2 = simObj.getClass().getMethod("getName");
-                    Object v = m2.invoke(simObj);
-                    if (v != null) return v.toString();
-                } catch (Throwable ignore2) { }
-            }
-        } catch (Throwable ignore) { }
-        return null;
-    }
+    private static double clamp01(double x) { return (x < 0.0) ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
     private static boolean trySetDouble(final Object obj, final double val, final String... setters) {
         for (String s : setters) {
@@ -324,25 +243,45 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         return false;
     }
 
-    // Simple gate to mirror Waterloo’s “coast + speed” policy
-    private boolean isExtensionAllowed(final SimulationStatus status) {
-        final Coordinate v = status.getRocketVelocity();
-        final double V = (v != null) ? Math.sqrt(Math.max(0, v.length2())) : 0.0;
-        return coastLatched && V > 23.5 && currentAirbrakeDeployment > 1e-6;
+    private static Double tryGetDouble(final Object obj, final String... getters) {
+        for (String g : getters) {
+            try {
+                Object v = obj.getClass().getMethod(g).invoke(obj);
+                if (v instanceof Number) return ((Number) v).doubleValue();
+            } catch (Throwable ignore) {}
+        }
+        return null;
     }
 
-    // -------------------- Debug helpers --------------------
-    private void setupDebug(final AirbrakeConfig cfg, final String simName) {
+    private static FlightDataType createType(String key, String name, String unitConst) {
         try {
-            if (cfg != null && cfg.isDebugEnabled()) {
-                final String tag = (simName == null || simName.isBlank()) ? "sim" : simName.replaceAll("\\W+","_");
-                dbg = new DebugTrace(true, cfg.isDbgWriteCsv(), cfg.isDbgShowConsole(), cfg.getDbgCsvDir(), tag);
-                dbg.note("DebugTrace initialized");
-            } else {
-                dbg = new DebugTrace(false, false, false, "", null);
+            Class<?> ug = null;
+            try { ug = Class.forName("info.openrocket.core.util.UnitGroup"); } catch (ClassNotFoundException ignore) { }
+            if (ug == null) try { ug = Class.forName("info.openrocket.core.units.UnitGroup"); } catch (ClassNotFoundException ignore) { }
+            if (ug == null) try { ug = Class.forName("net.sf.openrocket.unit.UnitGroup"); } catch (ClassNotFoundException ignore) { }
+            if (ug == null) return null;
+
+            Object units = ug.getField(unitConst).get(null);
+            for (java.lang.reflect.Method m : FlightDataType.class.getMethods()) {
+                if (m.getName().equals("getType") && m.getParameterCount() == 3) {
+                    Class<?>[] pt = m.getParameterTypes();
+                    if (pt[0] == String.class && pt[1] == String.class && pt[2].isAssignableFrom(units.getClass())) {
+                        return (FlightDataType) m.invoke(null, key, name, units);
+                    }
+                }
             }
-        } catch (Throwable t) {
-            dbg = null;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private double getLatestExtension(SimulationStatus status) {
+        double e = clamp01(ext);
+        if (AIRBRAKE_EXT != null) {
+            try {
+                double v = status.getFlightDataBranch().getLast(AIRBRAKE_EXT);
+                if (Double.isFinite(v)) e = clamp01(v);
+            } catch (Throwable ignore) {}
         }
+        return e;
     }
 }
