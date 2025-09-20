@@ -75,7 +75,7 @@ public final class ApogeePredictor {
     // ------------- Constructors --------------------
     public ApogeePredictor() {
         this(
-            /*minPackets*/   10,
+            /*minPackets*/   5,  // Lowered for faster readiness
             /*flightLen*/    120.0,
             /*dt*/           0.01,
             /*g*/            9.80665,
@@ -105,6 +105,12 @@ public final class ApogeePredictor {
 
     /** Feed **coast** samples: world-Z acceleration INCLUDING g, time step (s), altitude (m), vertical velocity (m/s). */
     public void update(double verticalAcceleration_includingG, double dt, double altitude, double verticalVelocity) {
+        // Skip if accel positive (safety for non-coast phases)
+        if (verticalAcceleration_includingG > 0.0) {
+            log.warn("[ApoPred] skipped update: positive accel {} (non-coast?)", verticalAcceleration_includingG);
+            return;
+        }
+
         currentAltitude = altitude;
         currentVelocity = verticalVelocity;
 
@@ -112,155 +118,139 @@ public final class ApogeePredictor {
         dts.addLast(Math.max(1e-6, dt));
 
         // Recompute cumulative time
-        final int newN = accelerations.size();
-        cumulativeTime = new double[newN];
+        final int n = dts.size();
+        if (cumulativeTime.length < n) cumulativeTime = new double[n];
+        double cumT = 0.0;
+        int i = 0;
+        for (double dti : dts) {
+            cumulativeTime[i++] = cumT;
+            cumT += dti;
+        }
+        tFitNow = cumT;
 
-        double tCum = 0.0;
-        int idx = 0;
-        for (double di : dts) {
-            cumulativeTime[idx++] = tCum;  // timestamp for this sample BEFORE adding its dt
-            tCum += di;
+        // Trim to recent history if too long (optional cap, e.g., last 1000)
+        while (accelerations.size() > 1000) {
+            accelerations.removeFirst();
+            dts.removeFirst();
         }
 
-        // Track the time of the latest sample (used as t0 when forecasting)
-        if (newN > 0) {
-            tFitNow = cumulativeTime[newN - 1];
-        }
-
-        boolean didFit = false;
-
-        if (newN >= APOGEE_PREDICTION_MIN_PACKETS && newN != lastRunLength) {
-            // Initial A guess = first sample (should be near -g), B guess = INIT_B
-            Double first = accelerations.peekFirst();
-            double A0 = (first != null && Double.isFinite(first)) ? first : INIT_A;
-
-            CurveCoefficients cc = curveFit(cumulativeTime, toArray(accelerations), A0, INIT_B);
-            this.A = cc.A;
-            this.B = cc.B;
-            this.uncertainties = cc.uncertainties;
-
-            if (log.isDebugEnabled()) {
-                final double T = cumulativeTime.length > 0 ? cumulativeTime[cumulativeTime.length - 1] : 0.0;
-                log.debug("[ApoPred] fit: A={}  B={}  σA={}  σB={}  N={}  T={}s", A, B, uncertainties[0], uncertainties[1], newN, T);
-            }
-
-            if (uncertainties[0] < UNCERTAINTY_THRESHOLD && uncertainties[1] < UNCERTAINTY_THRESHOLD) {
+        // Fit if enough points
+        final int len = accelerations.size();
+        if (len >= APOGEE_PREDICTION_MIN_PACKETS && len != lastRunLength) {
+            final double[] a = toArray(accelerations);
+            final double[] t = Arrays.copyOf(cumulativeTime, len);
+            final CurveCoefficients coeffs = fitCurve(a, t);
+            if (coeffs != null) {
+                A = coeffs.A; B = coeffs.B; uncertainties = coeffs.uncertainties;
                 hasConverged = true;
+                log.debug("[ApoPred] fit: A={} B={} σA={} σB={} N={} T={}s",
+                        fmt(A), fmt(B), fmt(uncertainties[0]), fmt(uncertainties[1]), len, fmt(tFitNow));
+
+                // Build LUT for predictions
+                updatePredictionLookupTable(A, B);
+
+                // Publish trace (if sink set)
+                if (traceSink != null) {
+                    double unc = Math.max(uncertainties[0] / Math.abs(A), uncertainties[1] / Math.max(1e-6, B));
+                    Double apoStrictObj = getPredictionIfReady();
+                    double apoStrict = (apoStrictObj != null) ? apoStrictObj : Double.NaN;
+                    Double apoBestObj = getApogeeBestEffort();
+                    double apoBest = (apoBestObj != null) ? apoBestObj : Double.NaN;
+                    publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG,
+                                 apoStrict, apoBest, unc, len, "fit complete");
+                }
             }
-
-            // Always refresh LUT from the CURRENT state
-            updatePredictionLookupTable(this.A, this.B);
-
-            lastRunLength = newN;
-            didFit = true;
+            lastRunLength = len;
         }
-
-        // Publish trace with current predictions
-        double apoStrictVal = Double.NaN;
-        Double tmpStrict = getPredictionIfReady();
-        if (tmpStrict != null && Double.isFinite(tmpStrict)) apoStrictVal = tmpStrict;
-
-        double apoBestVal = Double.NaN;
-        Double tmpBest = getApogeeBestEffort();
-        if (tmpBest != null && Double.isFinite(tmpBest)) apoBestVal = tmpBest;
-
-        double uncVal = Double.NaN;
-        if (uncertainties != null && uncertainties.length >= 2) {
-            double u0 = uncertainties[0], u1 = uncertainties[1];
-            if (Double.isFinite(u0) && Double.isFinite(u1)) uncVal = Math.max(u0, u1);
-            else if (Double.isFinite(u0)) uncVal = u0;
-            else if (Double.isFinite(u1)) uncVal = u1;
-        }
-
-        publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG,
-                     apoStrictVal, apoBestVal, uncVal, newN, didFit ? "fit" : "update");
     }
 
-    /** Strict output: null until fit uncertainties are below threshold. */
+    public void reset() {
+        accelerations.clear();
+        dts.clear();
+        cumulativeTime = new double[0];
+        tFitNow = 0.0;
+        hasConverged = false;
+        lastRunLength = 0;
+        A = INIT_A; B = INIT_B;
+        uncertainties = new double[] { Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY };
+        lutVelocities = null;
+        lutDeltaHeights = null;
+    }
+
     public Double getPredictionIfReady() {
-        if (!hasConverged) return null;
-        if (!hasUsableLut()) return null;
-        final double dH = interp1(currentVelocity, lutVelocities, lutDeltaHeights);
-        return currentAltitude + dH;
+        if (!hasConverged || uncertainties[0] > UNCERTAINTY_THRESHOLD * Math.abs(A) ||
+            uncertainties[1] > UNCERTAINTY_THRESHOLD * Math.max(1e-6, B)) {
+            return null;
+        }
+        return getApogeeBestEffort();
     }
 
-    /** Best-effort output: uses current LUT even if not converged (null if LUT not yet built). */
     public Double getApogeeBestEffort() {
-        if (!hasUsableLut()) return null;
-        final double dH = interp1(currentVelocity, lutVelocities, lutDeltaHeights);
-        return currentAltitude + dH;
+        if (lutVelocities == null || lutDeltaHeights == null || currentVelocity <= 0.0) return null;
+        final double deltaH = interp1(currentVelocity, lutVelocities, lutDeltaHeights);
+        return currentAltitude + deltaH;
     }
 
-    public boolean hasConverged()             { return hasConverged; }
-    public boolean hasUsableLut() { return lutVelocities != null && lutVelocities.length >= 2; }
-    public int     sampleCount()              { return accelerations.size(); }
-    public double  getA()                     { return A; }
-    public double  getB()                     { return B; }
-    public double[] getUncertainties()        { return Arrays.copyOf(uncertainties, uncertainties.length); }
-
-    // ------------- Fitting -------------------------
+    // ------------- Fit logic -----------------------
 
     private static final class CurveCoefficients {
         final double A, B;
         final double[] uncertainties;
-        CurveCoefficients(double A, double B, double[] uncertainties) {
-            this.A = A; this.B = B; this.uncertainties = uncertainties;
-        }
+        CurveCoefficients(double A, double B, double[] unc) { this.A = A; this.B = B; this.uncertainties = unc; }
     }
 
-    /** Nonlinear LS (Gauss–Newton + light LM) for a(t) = A (1 - B t)^4 with A<=0, B>=0. */
-    private CurveCoefficients curveFit(double[] t, double[] a, double A0, double B0) {
-        double A = (A0 > 0) ? -Math.abs(A0) : A0;
-        double B = Math.max(0.0, B0);
+    private CurveCoefficients fitCurve(double[] a, double[] t) {
+        final int n = a.length;
+        if (n < 2) return null;
+
+        // Gauss-Newton with LM damping
+        double A_est = INIT_A;
+        double B_est = INIT_B;
 
         for (int iter = 0; iter < MAX_ITERS; iter++) {
-            double H11 = 0, H12 = 0, H22 = 0;
-            double g1  = 0, g2  = 0;
-            double rss = 0;
+            double J11 = 0, J12 = 0, J21 = 0, J22 = 0;
+            double r1 = 0, r2 = 0;
 
-            for (int i = 0; i < t.length; i++) {
+            for (int i = 0; i < n; i++) {
                 final double ti = t[i];
-                final double oneMinusBt = clamp(1.0 - B * ti, -5.0, 5.0);
+                final double oneMinusBt = clamp(1.0 - B_est * ti, -5.0, 5.0);
                 final double oneMinusBt2 = oneMinusBt * oneMinusBt;
                 final double oneMinusBt3 = oneMinusBt2 * oneMinusBt;
                 final double oneMinusBt4 = oneMinusBt2 * oneMinusBt2;
 
-                final double fi = A * oneMinusBt4;
-                final double ri = a[i] - fi;        // residual (data - model)
-                rss += ri * ri;
+                final double f = A_est * oneMinusBt4;
+                final double r = a[i] - f;
 
                 final double dfdA = oneMinusBt4;
-                final double dfdB = -4.0 * A * ti * oneMinusBt3;
+                final double dfdB = -4.0 * A_est * ti * oneMinusBt3;
 
-                H11 += dfdA * dfdA;
-                H12 += dfdA * dfdB;
-                H22 += dfdB * dfdB;
+                J11 += dfdA * dfdA;
+                J12 += dfdA * dfdB;
+                J21 += dfdB * dfdA;
+                J22 += dfdB * dfdB;
 
-                g1  += dfdA * ri;   // J^T r
-                g2  += dfdB * ri;
+                r1 += r * dfdA;
+                r2 += r * dfdB;
             }
 
-            // Levenberg–Marquardt
-            final double lam = LM_LAMBDA;
-            H11 += lam;
-            H22 += lam;
+            // LM damping
+            J11 += LM_LAMBDA * J11;
+            J22 += LM_LAMBDA * J22;
 
-            final double det = H11 * H22 - H12 * H12;
+            final double det = J11 * J22 - J12 * J21;
             if (Math.abs(det) < 1e-18) break;
 
-            final double dA = ( H22 * g1 - H12 * g2) / det;
-            final double dB = (-H12 * g1 + H11 * g2) / det;
+            final double dA = (J22 * r1 - J12 * r2) / det;
+            final double dB = (J11 * r2 - J21 * r1) / det;
 
-            // Conservative step limiting
-            A += clamp(dA, -10.0, 10.0);
-            B += clamp(dB,  -1.0,  1.0);
+            A_est += dA;
+            B_est += dB;
 
-            // Enforce physical constraints
-            if (A > 0) A = -Math.abs(A);
-            if (B < 0) B = 0.0;
+            // Enforce constraints
+            if (A_est > 0.0) A_est = -Math.abs(A_est);  // A <= 0
+            B_est = Math.max(0.0, B_est);
 
-            // Stagnation
-            if (Math.abs(dA) < 1e-9 && Math.abs(dB) < 1e-9) break;
+            if (Math.abs(dA) < 1e-6 && Math.abs(dB) < 1e-6) break;
         }
 
         // Approximate covariance from (J^T J)^{-1} scaled by residual variance
@@ -268,17 +258,17 @@ public final class ApogeePredictor {
         double rss = 0;
         for (int i = 0; i < t.length; i++) {
             final double ti = t[i];
-            final double oneMinusBt = clamp(1.0 - B * ti, -5.0, 5.0);
+            final double oneMinusBt = clamp(1.0 - B_est * ti, -5.0, 5.0);
             final double oneMinusBt2 = oneMinusBt * oneMinusBt;
             final double oneMinusBt3 = oneMinusBt2 * oneMinusBt;
             final double oneMinusBt4 = oneMinusBt2 * oneMinusBt2;
 
-            final double fi = A * oneMinusBt4;
+            final double fi = A_est * oneMinusBt4;
             final double ri = a[i] - fi;
             rss += ri * ri;
 
             final double dfdA = oneMinusBt4;
-            final double dfdB = -4.0 * A * ti * oneMinusBt3;
+            final double dfdB = -4.0 * A_est * ti * oneMinusBt3;
             H11 += dfdA * dfdA;
             H12 += dfdA * dfdB;
             H22 += dfdB * dfdB;
@@ -296,15 +286,15 @@ public final class ApogeePredictor {
         final double sA = varA > 0 ? Math.sqrt(varA) : Double.POSITIVE_INFINITY;
         final double sB = varB > 0 ? Math.sqrt(varB) : Double.POSITIVE_INFINITY;
 
-        return new CurveCoefficients(A, B, new double[] { sA, sB });
+        return new CurveCoefficients(A_est, B_est, new double[] { sA, sB });
     }
 
     // ------------- LUT build -----------------------
 
-        /**
-         * Build ΔH(v) table from current state by integrating the fitted model forward until apogee.
-         */
-        private void updatePredictionLookupTable(double A, double B) {
+    /**
+     * Build ΔH(v) table from current state by integrating the fitted model forward until apogee.
+     */
+    private void updatePredictionLookupTable(double A, double B) {
         final int N = Math.max(2, (int) Math.ceil(FLIGHT_LENGTH_SECONDS / INTEGRATION_DT_SECONDS));
         final double t0 = this.tFitNow;  // <-- time offset from last sample
 
@@ -398,4 +388,6 @@ public final class ApogeePredictor {
         final double t = (x - x0) / Math.max(1e-12, (x1 - x0));
         return y0 + t * (y1 - y0);
     }
+
+    private static String fmt(double x) { return String.format("%.3f", x); }
 }

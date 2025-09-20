@@ -101,16 +101,19 @@ public final class AirbrakeController {
         }
 
         boolean changed = false;
-        if (ap > targetApogeeMeters && !Boolean.TRUE.equals(airbrakesExtended)) {
+        
+        if (ap > targetApogeeMeters) {
             airbrakesExtended = true;
-            currentSetpointU = 1.0; hasSetpoint = true;
+            currentSetpointU = 1.0; 
+            hasSetpoint = true;
             if (context != null) context.extend_airbrakes();
             changed = true;
             if (dbg != null) dbg.addController(safeTime(status), 1.0, "extend: apogee>target");
             log.info("[Controller] apogee={} > target={} → EXTEND", fmt(ap), fmt(targetApogeeMeters));
-        } else if (ap <= targetApogeeMeters && Boolean.TRUE.equals(airbrakesExtended)) {
+        } else if (ap <= targetApogeeMeters) {
             airbrakesExtended = false;
-            currentSetpointU = 0.0; hasSetpoint = true;
+            currentSetpointU = 0.0; 
+            hasSetpoint = true;
             if (context != null) {
                 context.retract_airbrakes();
                 context.switch_altitude_back_to_pressure();

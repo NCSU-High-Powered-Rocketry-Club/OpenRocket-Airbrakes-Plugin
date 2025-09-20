@@ -28,7 +28,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     // ---- gates (configurable time, fixed vz as requested) -------------------
     private final double extTimeGateS;              // apply brakes after this time (s)
-    private final double vzGateMps = 18.0;          // vertical speed gate (m/s)
 
     // ---- One-shot LUT edge logs --------------------------------------------
     private boolean loggedMachLowOnce  = false;
@@ -45,10 +44,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private final double refAreaFallback;
 
     // Custom columns (best-effort). If null, we skip writing/reading.
-    private static final FlightDataType AIRBRAKE_EXT =
-            createType("airbrakeExt", "airbrakeExt", "UNITS_RELATIVE");
-    private static final FlightDataType PRED_APOGEE =
-            createType("predictedApogee", "predictedApogee", "UNITS_DISTANCE");
+    private static final FlightDataType AIRBRAKE_EXT = createType("airbrakeExt", "airbrakeExt", "UNITS_RELATIVE");
+    private static final FlightDataType PRED_APOGEE = createType("predictedApogee", "predictedApogee", "UNITS_DISTANCE");
 
     public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes,
                                       AirbrakeController controller,
@@ -84,12 +81,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         } catch (Throwable ignored) {}
 
         try { predictor.getClass().getMethod("reset").invoke(predictor); } catch (Throwable ignored) {}
-    }
-
-    private boolean isExtensionAllowed(SimulationStatus status) {
-        final Coordinate v = status.getRocketVelocity();
-        final double vz = (v != null) ? v.z : 0.0;
-        return status.getSimulationTime() > extTimeGateS && vz > vzGateMps;
     }
 
     @Override
@@ -139,7 +130,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         if (airbrakes == null || forces == null || status == null) return forces;
 
         // Gate by time and vertical speed (Waterloo-style), and require some extension
-        if (!isExtensionAllowed(status)) return forces;
         final double airbrakeExt = getLatestExtension(status);
         if (!(airbrakeExt > 1e-6)) return forces;
 
