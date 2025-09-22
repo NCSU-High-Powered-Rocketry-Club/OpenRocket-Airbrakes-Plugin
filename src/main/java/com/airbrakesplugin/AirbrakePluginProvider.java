@@ -8,6 +8,6 @@ import info.openrocket.core.simulation.extension.AbstractSimulationExtensionProv
 public class AirbrakePluginProvider extends AbstractSimulationExtensionProvider {
 
     public AirbrakePluginProvider() {
-        super(AirbrakeExtension.class, "6DOF Airbrake Simulation", "Extensions");
+        super(AirbrakeExtension.class, "HPRC Airbrakes Plugin", "Extensions");
     }
 }

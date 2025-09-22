@@ -51,11 +51,10 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
                     new AirbrakeController(config.getTargetApogee(), predictor, noopCtx);
 
             // 4) Waterloo-style gating parameters
-            final double extTimeSeconds = 9.0;                          // enable after 9 s (matches Waterloo default)
             final double refAreaFallback = Math.max(1e-9, config.getReferenceArea());
 
             // 5) Listener
-            return new AirbrakeSimulationListener(airbrakes, controller, predictor, extTimeSeconds, refAreaFallback);
+            return new AirbrakeSimulationListener( airbrakes, controller, predictor, refAreaFallback, config);
         } catch (Exception e) {
             throw new RuntimeException("Failed to create AirbrakeSimulationListener: " + e.getMessage(), e);
         }
