@@ -1,309 +1,156 @@
 package com.airbrakesplugin;
 
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVParser;
-import org.apache.commons.csv.CSVRecord;
-import org.apache.commons.math3.analysis.BivariateFunction;
-import org.apache.commons.math3.analysis.interpolation.BicubicInterpolator;
+import com.airbrakesplugin.util.AirDensity;
+import com.airbrakesplugin.util.ExtrapolationType;
+import com.airbrakesplugin.util.GenericFunction2D;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.FileReader;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.Reader;
-import java.util.ArrayList;
-import java.util.List;
+import java.nio.file.Path;
+import java.util.Objects;
 
-public class AirbrakeAerodynamics {
+/**
+ * AirbrakeAerodynamics
+ *
+ * Interpolates ΔDrag (Newtons) as a function of (Mach, DeploymentFraction).
+ * - CSV must contain a full rectangular grid with columns:
+ *     Mach, DeploymentPercentage, DeltaDrag_N
+ * - Interpolation: bilinear (robust/monotone).
+ * - Extrapolation: CONSTANT (edge clamp) by default.
+ *
+ * Notes:
+ * - DeploymentFraction is expected in [0..1]. Values outside are clamped.
+ * - All previous Cd/Cm bicubic logic has been removed for reliability.
+ */
+public final class AirbrakeAerodynamics {
 
     private static final Logger LOG = LoggerFactory.getLogger(AirbrakeAerodynamics.class);
 
+    /** Tiny numeric epsilon used for domain nudging when needed. */
+    private static final double EPS = 1e-12;
+
+    /** Drag surface in Newtons (ΔDrag_N). */
+    private GenericFunction2D deltaDragSurface;
+
+    /** Path kept only for diagnostics/reload if desired. */
+    private Path sourceCsv;
+
     /**
-     * Anything below this threshold is treated as CLOSED (0),
-     * anything at/above is treated as FULLY OPEN (1).
-     * Keep near 1.0 to only grant "open" when actuator is essentially at its limit.
+     * Build from a CSV file path. The path can be absolute or relative to the working dir
+     * or a deployed resource path that you copy to disk before calling this.
      */
-    private static final double OPEN_THRESHOLD = 0.999;
-
-    /** Tiny offset used to nudge values inside the interpolation domain. */
-    private static final double EPS_FRACTION = 1e-9;
-
-    private final BivariateFunction cdFunction;
-    private final BivariateFunction cmFunction;
-    private final double[] machPoints;
-    private final double[] deploymentPoints;
-
     public AirbrakeAerodynamics(String csvFilePath) {
-        if (csvFilePath == null || csvFilePath.isBlank())
-            throw new IllegalArgumentException("CSV file path is null/empty");
-
-        try {
-            List<AirbrakeDataPoint> dataPoints = loadCFDData(csvFilePath);
-            machPoints = extractDistinctSortedValues(dataPoints, AirbrakeDataPoint::getMach);
-            deploymentPoints = extractDistinctSortedValues(dataPoints, AirbrakeDataPoint::getDeploymentPercentage);
-
-            validateDataPoints();
-
-            double[][] cdGridValues = buildValueGrid(dataPoints, AirbrakeDataPoint::getCdIncrement);
-            double[][] cmGridValues = buildValueGrid(dataPoints, AirbrakeDataPoint::getCmIncrement);
-
-            BicubicInterpolator interpolator = new BicubicInterpolator();
-            cdFunction = interpolator.interpolate(machPoints, deploymentPoints, cdGridValues);
-            cmFunction = interpolator.interpolate(machPoints, deploymentPoints, cmGridValues);
-
-            LOG.info("Airbrake CFD data loaded with {} Mach points, {} deployment points",
-                    machPoints.length, deploymentPoints.length);
-        } catch (IOException e) {
-            LOG.error("Failed to load airbrake CFD data: {}", e.getMessage());
-            throw new IllegalArgumentException("Failed to load airbrake CFD data", e);
+        Objects.requireNonNull(csvFilePath, "CSV file path must not be null");
+        if (csvFilePath.isBlank()) {
+            throw new IllegalArgumentException("CSV file path is empty");
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Public API (binary endpoints, robust to NaN/out-of-range inputs)
-    // -------------------------------------------------------------------------
-
-    /** Returns ΔCd at the current Mach; deployment coerced to CLOSED or OPEN grid endpoints. */
-    public double getIncrementalCd(double mach, double deployFrac) {
-        try {
-            final double mEval = sanitizeMach(mach);
-            final double dEval = pickBinaryDeploymentValue(deployFrac);
-            final double val   = safeEvaluate(cdFunction, mEval, dEval);
-            return Double.isFinite(val) ? val : 0.0;
-        } catch (Exception e) {
-            LOG.warn("Cd interpolation (binary deploy) failed: mach={}, deployIn={}, error={}",
-                    mach, deployFrac, e.getMessage());
-            return 0.0;
-        }
-    }
-
-    /** Returns ΔCm at the current Mach; deployment coerced to CLOSED or OPEN grid endpoints. */
-    public double getIncrementalCm(double mach, double deployFrac) {
-        try {
-            final double mEval = sanitizeMach(mach);
-            final double dEval = pickBinaryDeploymentValue(deployFrac);
-            final double val   = safeEvaluate(cmFunction, mEval, dEval);
-            return Double.isFinite(val) ? val : 0.0;
-        } catch (Exception e) {
-            LOG.warn("Cm interpolation (binary deploy) failed: mach={}, deployIn={}, error={}",
-                    mach, deployFrac, e.getMessage());
-            return 0.0;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    /**
-     * Map any deployment fraction to one of the two endpoints in the CFD table:
-     * CLOSED -> deploymentPoints[0], OPEN -> deploymentPoints[last].
-     * NaN → CLOSED endpoint.
-     */
-    private double pickBinaryDeploymentValue(double deployFrac) {
-        if (!Double.isFinite(deployFrac)) {
-            LOG.trace("Deployment {} treated as CLOSED (NaN/non-finite).", deployFrac);
-            return deploymentPoints[0];
-        }
-        final boolean open = (deployFrac >= OPEN_THRESHOLD);
-        final double chosen = open ? deploymentPoints[deploymentPoints.length - 1] : deploymentPoints[0];
-
-        // Informative (non-spammy) traces when mid-values are coerced.
-        if (!open && deployFrac > 0.0 && deployFrac < OPEN_THRESHOLD) {
-            LOG.trace("Deployment {} coerced to CLOSED endpoint {}", String.format("%.3f", deployFrac), String.format("%.3f", chosen));
-        } else if (open && deployFrac < 1.0) {
-            LOG.trace("Deployment {} coerced to OPEN endpoint {}", String.format("%.3f", deployFrac), String.format("%.3f", chosen));
-        }
-        return chosen;
+        loadDeltaDragSurface(Path.of(csvFilePath), /*extrap*/ ExtrapolationType.CONSTANT);
     }
 
     /**
-     * Ensure Mach is finite and strictly within the interpolation domain.
-     * NaN/out-of-range → nearest bound, then nudged slightly inside.
+     * Alternate constructor if you want to pass an already-resolved Path and choose extrapolation.
      */
-    private double sanitizeMach(double mach) {
-        final double min = machPoints[0];
-        final double max = machPoints[machPoints.length - 1];
+    public AirbrakeAerodynamics(Path csvPath, ExtrapolationType extrapolation) {
+        loadDeltaDragSurface(csvPath, extrapolation == null ? ExtrapolationType.CONSTANT : extrapolation);
+    }
 
+    /**
+     * (Re)load the ΔDrag surface from CSV.
+     */
+    public final void loadDeltaDragSurface(Path csvPath, ExtrapolationType extrapolation) {
+        Objects.requireNonNull(csvPath, "CSV path must not be null");
+        Objects.requireNonNull(extrapolation, "Extrapolation must not be null");
+        try {
+            this.deltaDragSurface = GenericFunction2D.fromCsv(csvPath, extrapolation);
+            this.sourceCsv = csvPath;
+            LOG.info("Loaded airbrake ΔDrag surface: {} (extrapolation: {})", csvPath, extrapolation);
+        } catch (Exception e) {
+            LOG.error("Failed to load ΔDrag surface from {}: {}", csvPath, e.toString());
+            throw (e instanceof IllegalArgumentException) ? (IllegalArgumentException) e
+                    : new IllegalArgumentException("Cannot load ΔDrag surface: " + csvPath, e);
+        }
+    }
+
+    // -----------------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------------
+
+    /**
+     * Interpolate ΔDrag (Newtons) at the given Mach and deployment fraction.
+     *
+     * @param mach         Freestream Mach number (finite; will be clamped at grid edges).
+     * @param deployFrac   Deployment fraction in [0..1] (will be clamped).
+     * @return ΔDrag in Newtons (>= 0 typically), or 0.0 if the surface is not loaded.
+     */
+    public double getDeltaDragN(double mach, double deployFrac) {
+        if (deltaDragSurface == null) {
+            LOG.warn("ΔDrag surface not loaded; returning 0 N");
+            return 0.0;
+        }
         if (!Double.isFinite(mach)) {
-            // Default to lower bound when NaN; matches your warning line case.
-            final double nudged = nudgeInside(min, min, max);
-            LOG.trace("Mach {} sanitized to {}", mach, nudged);
-            return nudged;
+            LOG.trace("Non-finite Mach={} → using 0.0", mach);
+            mach = 0.0;
         }
-        if (mach <= min) return nudgeInside(min, min, max);
-        if (mach >= max) return nudgeInside(max, min, max);
-        return mach;
-    }
-
-    /** Evaluate f(x,y) with a small nudge inside the domain to avoid edge pathologies. */
-    private double safeEvaluate(BivariateFunction f, double mach, double deployValue) {
-        // Deployment value is guaranteed to be one of the exact grid endpoints.
-        // We only ever nudge Mach (x), not deployment (y), to preserve binary behavior.
-        final double min = machPoints[0];
-        final double max = machPoints[machPoints.length - 1];
-
-        // Try at the given mach; if it fails or returns NaN, try tiny nudges inward.
-        double x = mach;
-        for (int i = 0; i < 3; i++) {
-            try {
-                double val = f.value(x, deployValue);
-                if (Double.isFinite(val)) return val;
-            } catch (Exception ignore) {
-                // fall through to nudge
-            }
-            // Nudge inward proportionally to domain width
-            x = nudgeInside(x, min, max);
+        if (!Double.isFinite(deployFrac)) {
+            LOG.trace("Non-finite deploy={} → using 0.0", deployFrac);
+            deployFrac = 0.0;
         }
-        // Give up gracefully
-        LOG.debug("Interpolation failed at mach={} (sanitized from {}), deploy={}; returning 0",
-                x, mach, deployValue);
+        // Clamp deployment to [0..1] and nudge slightly to avoid exact boundaries if needed.
+        double dep = clamp01(deployFrac);
+        dep = nudge(dep, 0.0, 1.0);
+
+        try {
+            double val = deltaDragSurface.value(mach, dep);
+            if (Double.isFinite(val)) return val;
+        } catch (Exception ex) {
+            LOG.debug("ΔDrag interpolation failed at Mach={}, Deploy={} from {}: {}",
+                    mach, dep, sourceCsv, ex.toString());
+        }
         return 0.0;
     }
 
-    /** Returns a value strictly inside (min,max), or at boundaries slightly offset inward. */
-    private double nudgeInside(double x, double min, double max) {
-        final double w = Math.max(1.0, Math.abs(max - min));
-        final double eps = EPS_FRACTION * w;
+    /**
+     * Convenience wrapper used by the SimulationListener:
+     * computes Mach from (speed, altitudeMSL) and returns ΔDrag [N] for the given deployment.
+     *
+     * @param deploymentFrac  deployment fraction [0..1]
+     * @param speed           speed magnitude [m/s]
+     * @param altitudeMSL     altitude above mean sea level [m]
+     * @return ΔDrag in Newtons
+     */
+    public double calculateDragForce(double deploymentFrac, double speed, double altitudeMSL) {
+        if (!isReady()) return 0.0;
+        if (!Double.isFinite(speed) || speed <= 0) return 0.0;
+        if (!Double.isFinite(altitudeMSL)) altitudeMSL = 0.0;
 
-        if (x <= min) return Math.min(min + eps, max - eps);
-        if (x >= max) return Math.max(max - eps, min + eps);
-        // already inside: pull slightly away from the closest bound
-        final double dMin = Math.abs(x - min);
-        final double dMax = Math.abs(max - x);
-        if (dMin < dMax) return Math.min(x + eps, max - eps);
-        return Math.max(x - eps, min + eps);
+        final double mach = AirDensity.machFromV(speed, altitudeMSL);
+        final double dep  = clamp01(deploymentFrac);
+        final double dN   = getDeltaDragN(mach, dep);
+
+        LOG.trace("calculateDragForce: M={} dep={} → ΔDrag={} N (speed={}, altMSL={})",
+                mach, dep, dN, speed, altitudeMSL);
+        return dN;
     }
 
-    private List<AirbrakeDataPoint> loadCFDData(String csvFilePath) throws IOException {
-        LOG.info("Loading CFD data from: {}", csvFilePath);
-        List<AirbrakeDataPoint> dataPoints = new ArrayList<>();
-
-        Reader reader = openReader(csvFilePath);
-        CSVFormat csvFormat = CSVFormat.DEFAULT.builder()
-                .setHeader("Mach", "DeploymentPercentage", "Cd_increment", "Cm_increment")
-                .setSkipHeaderRecord(true)
-                .setTrim(true)
-                .setCommentMarker('#')
-                .setIgnoreEmptyLines(true)
-                .build();
-
-        try (CSVParser parser = new CSVParser(reader, csvFormat)) {
-            for (CSVRecord record : parser) {
-                try {
-                    double mach = Double.parseDouble(record.get("Mach"));
-                    double deploy = Double.parseDouble(record.get("DeploymentPercentage")) / 100.0;
-                    double cdIncr = Double.parseDouble(record.get("Cd_increment"));
-                    double cmIncr = Double.parseDouble(record.get("Cm_increment"));
-                    dataPoints.add(new AirbrakeDataPoint(mach, deploy, cdIncr, cmIncr));
-                } catch (Exception e) {
-                    LOG.warn("Skipping malformed CSV record {}: {}", record.getRecordNumber(), e.getMessage());
-                }
-            }
-        }
-
-        LOG.info("Loaded {} data points from {}", dataPoints.size(), csvFilePath);
-        if (dataPoints.isEmpty()) {
-            throw new IOException("No valid CFD data points loaded from: " + csvFilePath);
-        }
-
-        return dataPoints;
+    /** @return true if the ΔDrag surface is loaded. */
+    public boolean isReady() {
+        return deltaDragSurface != null;
     }
 
-    private Reader openReader(String csvFilePath) throws IOException {
-        try {
-            Reader reader = new FileReader(csvFilePath);
-            LOG.debug("Opened {} from filesystem", csvFilePath);
-            return reader;
-        } catch (IOException e) {
-            LOG.debug("Trying to load {} as resource", csvFilePath);
+    // -----------------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------------
 
-            InputStream is = getClass().getClassLoader().getResourceAsStream(csvFilePath);
-            if (is == null) {
-                is = Thread.currentThread().getContextClassLoader().getResourceAsStream(csvFilePath);
-            }
-
-            if (is != null) {
-                LOG.debug("Opened {} as classpath resource", csvFilePath);
-                return new InputStreamReader(is);
-            } else {
-                throw new IOException("CFD data file not found: " + csvFilePath);
-            }
-        }
+    private static double clamp01(double v) {
+        if (v < 0.0) return 0.0;
+        if (v > 1.0) return 1.0;
+        return v;
     }
 
-    private double[] extractDistinctSortedValues(List<AirbrakeDataPoint> dataPoints, java.util.function.Function<AirbrakeDataPoint, Double> valueExtractor) {
-        return dataPoints.stream()
-                .map(valueExtractor)
-                .distinct()
-                .sorted()
-                .mapToDouble(Double::doubleValue)
-                .toArray();
-    }
-
-    private void validateDataPoints() throws IOException {
-        if (machPoints.length < 2 || deploymentPoints.length < 2) {
-            throw new IOException(String.format(
-                    "Insufficient distinct data points for interpolation. Found %d Mach points and %d deployment points.",
-                    machPoints.length, deploymentPoints.length));
-        }
-    }
-
-    private double[][] buildValueGrid(List<AirbrakeDataPoint> dataPoints,
-                                      java.util.function.Function<AirbrakeDataPoint, Double> valueExtractor) throws IOException {
-        double[][] grid = new double[machPoints.length][deploymentPoints.length];
-
-        for (int i = 0; i < machPoints.length; i++) {
-            for (int j = 0; j < deploymentPoints.length; j++) {
-                double m = machPoints[i];
-                double d = deploymentPoints[j];
-
-                AirbrakeDataPoint point = findDataPoint(dataPoints, m, d);
-                if (point == null) {
-                    throw new IOException(String.format(
-                            "Missing data point for Mach=%.3f, Deploy=%.3f", m, d));
-                }
-
-                grid[i][j] = valueExtractor.apply(point);
-            }
-        }
-
-        return grid;
-    }
-
-    private AirbrakeDataPoint findDataPoint(List<AirbrakeDataPoint> dataPoints, double mach, double deploy) {
-        final double EPSILON = 1e-9;
-        return dataPoints.stream()
-                .filter(p -> Math.abs(p.getMach() - mach) < EPSILON
-                        && Math.abs(p.getDeploymentPercentage() - deploy) < EPSILON)
-                .findFirst()
-                .orElse(null);
-    }
-
-    // --- unused at the moment, but handy ------------------------------------
-    @SuppressWarnings("unused")
-    private static double clamp(double value, double min, double max) {
-        return Math.max(min, Math.min(max, value));
-    }
-
-    private static final class AirbrakeDataPoint {
-        private final double mach;
-        private final double deploymentPercentage;
-        private final double cdIncrement;
-        private final double cmIncrement;
-
-        AirbrakeDataPoint(double m, double d, double cd, double cm) {
-            this.mach = m;
-            this.deploymentPercentage = d;
-            this.cdIncrement = cd;
-            this.cmIncrement = cm;
-        }
-
-        double getMach() { return mach; }
-        double getDeploymentPercentage() { return deploymentPercentage; }
-        double getCdIncrement() { return cdIncrement; }
-        double getCmIncrement() { return cmIncrement; }
+    private static double nudge(double v, double min, double max) {
+        // Pull off exact boundaries by an extremely small amount when helpful.
+        if (v <= min) return Math.nextUp(min + EPS);
+        if (v >= max) return Math.nextDown(max - EPS);
+        return v;
     }
 }

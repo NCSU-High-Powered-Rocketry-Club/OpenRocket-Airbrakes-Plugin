@@ -20,7 +20,7 @@ import org.slf4j.LoggerFactory;
  *  - Gates: burnout + altitude + Mach
  *  - Control: if predictedApogee > targetApogee => EXTEND (ext=1), else RETRACT (ext=0)
  *  - Writes airbrakeExt (always 0.0 or 1.0) and predictedApogee
- *  - Aerodynamics uses in-memory ext (no branch reads → no NaN)
+ *  - Aerodynamics uses in-memory ext (and persists to FDB); no NaNs
  *  - Tracks OpenRocket altitude (MSL) as OpenRoc_alt for comparison
  */
 public final class AirbrakeSimulationListener extends AbstractSimulationListener {
@@ -160,7 +160,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         // ---- Read predictor outputs ----
         Double apUsed = null;
         try {
-            // If your predictor exposes a "ready" value, try it first
             final Double apStrict = predictor.getPredictionIfReady();
             if (apStrict != null && Double.isFinite(apStrict)) {
                 apUsed = apStrict;
@@ -184,7 +183,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.debug("Apogee(pred)=N/A (predictor not ready)");
         }
 
-        // --- Your control: if apogee > target → EXTEND; else RETRACT (subject to gates) ---
+        // --- Control: if apogee > target → EXTEND; else RETRACT (subject to gates) ---
         double airbrake_ext; // authoritative for this step (will be forced to 0.0/1.0)
 
         if (isExtensionAllowed(status)) {
@@ -195,11 +194,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
                 airbrake_ext = 0.0;
                 log.debug("Predictor not ready; retracting by default");
             } else {
-                if (apUsed > target) {
-                    airbrake_ext = 1.0;
-                } else {
-                    airbrake_ext = 0.0;
-                }
+                airbrake_ext = (apUsed > target) ? 1.0 : 0.0;
                 log.debug("Control decision: apUsed={} target={} => airbrake_ext={}", apUsed, target, airbrake_ext);
             }
         } else {
@@ -210,12 +205,11 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         // Enforce hard 0.0 / 1.0, assign to class state, and persist
         airbrake_ext = (airbrake_ext >= 0.5) ? 1.0 : 0.0;
-        this.ext = airbrake_ext;                 // drives postAerodynamicCalculation (no NaNs)
+        this.ext = airbrake_ext;                 // authoritative for postAerodynamicCalculation
         fdb.setValue(AIRBRAKE_EXT, this.ext);    // also visible in flight data plots
 
         return true;
     }
-
 
     @Override
     public FlightConditions postFlightConditions(SimulationStatus status,
@@ -226,58 +220,70 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         return fc;
     }
 
+    /**
+     * Overrides the coefficient of drag after the aerodynamic calculations are done each timestep.
+     * We compute an equivalent CDAxial from the tabulated ΔDrag [N] so OR's solver consumes it.
+     */
     @Override
     public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
                                                         final AerodynamicForces forces) throws SimulationException {
-        log.debug("Post-aerodynamic calculation - initial CDaxial: {}, CN: {}",
-                  forces.getCDaxial(), forces.getCN());
-
+        // Coast-only / gating guard (matches your policy)
         if (!isExtensionAllowed(status)) {
             log.debug("Extension not allowed, no aerodynamic modifications");
             return forces;
         }
 
-        // Use authoritative in-memory extension; DO NOT read the branch here
-        final double airbrakeExt = this.ext;   // guaranteed 0.0 or 1.0
-        if (airbrakeExt <= 0.0) {
-            log.debug("Airbrake extension is 0.0, no modifications");
+        // Latest kinematics
+        final Coordinate vVec   = status.getRocketVelocity();
+        final double     v2     = vVec.length2();
+        final double     speed  = Math.sqrt(v2);
+        final double     vz     = vVec.z; // kept for debugging parity with your snippet
+
+        // Latest environment
+        if (flightConditions == null) {
+            log.debug("No FlightConditions yet; skipping aero override this step");
+            return forces;
+        }
+        final double rho     = flightConditions.getAtmosphericConditions().getDensity();
+        final double dynP    = 0.5 * rho * v2;
+        final double refArea = flightConditions.getRefArea();
+
+        // Get latest extension from FDB (you also keep ext in-memory; both are consistent)
+        final FlightDataBranch fdb = status.getFlightDataBranch();
+        double airbrakeExt = fdb.getLast(AIRBRAKE_EXT);
+        if (!Double.isFinite(airbrakeExt)) airbrakeExt = this.ext;
+        airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0; // enforce 0/1
+
+        // Altitude (MSL) for speed-of-sound / Mach inside calculateDragForce
+        final double altitudeMSL = status.getRocketPosition().z
+                + status.getSimulationConditions().getLaunchSite().getAltitude();
+
+        // Compute drag from your ΔDrag surface (uses speed magnitude, not just vz)
+        final double dragForceN = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
+        log.debug("ΔDrag = {} N at ext={}  (speed={} m/s, vz={} m/s, altMSL={})",
+                  dragForceN, airbrakeExt, speed, vz, altitudeMSL);
+
+        if (dynP <= 0 || refArea <= 0) {
+            log.debug("dynP={} or refArea={} non-positive; skipping aero override", dynP, refArea);
             return forces;
         }
 
-        // Speed and OpenRocket altitude (MSL) for Mach
-        final Coordinate v = status.getRocketVelocity();
-        final double v2 = v.length2();
-        final double speed = Math.sqrt(v2);
-        final double OpenRoc_alt = status.getRocketPosition().z +
-                status.getSimulationConditions().getLaunchSite().getAltitude();
-        log.debug("Speed: {} m/s, OpenRoc_alt(MSL): {} m", speed, OpenRoc_alt);
+        // Convert force → equivalent CDAxial for OR
+        final double cDAxial = dragForceN / (dynP * refArea);
 
-        // Mach and atmos/area
-        final double mach = AirDensity.machFromV(speed, OpenRoc_alt);
-        final double rho  = flightConditions.getAtmosphericConditions().getDensity();
-        final double dynP = 0.5 * rho * v2;
-        final double refArea = (flightConditions != null && flightConditions.getRefArea() > 0)
-                ? flightConditions.getRefArea() : 0.0;
-        final double cd0 = forces.getCDaxial();
-
-        log.debug("Atmospheric conditions - density: {}, dynamic pressure: {}, refArea: {}", rho, dynP, refArea);
-
-        // ΔCd from LUT
-        final double dCd = airbrakes.getIncrementalCd(mach, airbrakeExt);
-        log.debug("Incremental Cd from airbrakes: {} (mach: {}, ext: {})", dCd, mach, airbrakeExt);
-
-        // Apply ΔCd to CDAxial
-        final double cDAxial = cd0 + dCd;
-        log.debug("Setting new CDaxial: {} (old value: {})", cDAxial, forces.getCDaxial());
+        // Note: this "CDAxial" is an equivalent scalar for solver compatibility
+        // (AOA effects small per your experiments)
+        final double oldCd = forces.getCDaxial();
         forces.setCDaxial(cDAxial);
 
         // Optional diagnostic: predicted apogee this step
-        final double ap = status.getFlightDataBranch().getLast(PRED_APOGEE);
+        final double ap = fdb.getLast(PRED_APOGEE);
         if (Double.isFinite(ap)) {
-            log.debug("PostAero: Apogee(pred)={} m", ap);
+            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)={} m", cDAxial, oldCd, ap);
+        } else {
+            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)=N/A", cDAxial, oldCd);
         }
 
         return forces;
     }
 }
-
