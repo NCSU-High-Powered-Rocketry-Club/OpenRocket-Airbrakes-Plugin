@@ -1,4 +1,3 @@
-// src/main/java/com/airbrakesplugin/util/AirDensity.java
 package com.airbrakesplugin.util;
 
 public final class AirDensity {
