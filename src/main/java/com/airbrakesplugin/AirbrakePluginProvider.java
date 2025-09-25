@@ -2,9 +2,8 @@ package com.airbrakesplugin;
 
 import info.openrocket.core.plugin.Plugin;
 import info.openrocket.core.simulation.extension.AbstractSimulationExtensionProvider;
-// import net.sf.openrocket.simulation.extension.SimulationExtension; // Not directly needed here
 
-@Plugin // Corrected annotation
+@Plugin 
 public class AirbrakePluginProvider extends AbstractSimulationExtensionProvider {
 
     public AirbrakePluginProvider() {

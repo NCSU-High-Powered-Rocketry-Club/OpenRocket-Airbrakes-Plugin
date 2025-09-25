@@ -43,7 +43,7 @@ public final class AirbrakeAerodynamics {
         if (csvFilePath.isBlank()) {
             throw new IllegalArgumentException("CSV file path is empty");
         }
-        loadDragSurface(Path.of(csvFilePath), /*extrap*/ ExtrapolationType.CONSTANT);
+        loadDragSurface(Path.of(csvFilePath), ExtrapolationType.CONSTANT);
     }
 
     /**
@@ -65,8 +65,7 @@ public final class AirbrakeAerodynamics {
             LOG.info("Loaded airbrake Drag surface: {} (extrapolation: {})", csvPath, extrapolation);
         } catch (Exception e) {
             LOG.error("Failed to load Drag surface from {}: {}", csvPath, e.toString());
-            throw (e instanceof IllegalArgumentException) ? (IllegalArgumentException) e
-                    : new IllegalArgumentException("Cannot load Drag surface: " + csvPath, e);
+            throw (e instanceof IllegalArgumentException) ? (IllegalArgumentException) e : new IllegalArgumentException("Cannot load Drag surface: " + csvPath, e);
         }
     }
 
@@ -94,6 +93,7 @@ public final class AirbrakeAerodynamics {
             LOG.trace("Non-finite deploy={} → using 0.0", deployFrac);
             deployFrac = 0.0;
         }
+        
         // Clamp deployment to [0..1] and nudge slightly to avoid exact boundaries if needed.
         double dep = clamp01(deployFrac);
         dep = nudge(dep, 0.0, 1.0);
@@ -123,11 +123,10 @@ public final class AirbrakeAerodynamics {
         if (!Double.isFinite(altitudeMSL)) altitudeMSL = 0.0;
 
         final double mach = AirDensity.machFromV(speed, altitudeMSL);
-        final double dep  = clamp01(deploymentFrac);
-        final double FN   = getAirbrakeDragN(mach, dep);
+        final double dep = clamp01(deploymentFrac);
+        final double FN = getAirbrakeDragN(mach, dep);
 
-        LOG.trace("calculateDragForce: M={} dep={} → Drag={} N (speed={} m/s, altMSL={} m)",
-                mach, dep, FN, speed, altitudeMSL);
+        LOG.trace("calculateDragForce: M={} dep={} → Drag={} N (speed={} m/s, altMSL={} m)", mach, dep, FN, speed, altitudeMSL);
         return FN;
     }
 
@@ -136,9 +135,7 @@ public final class AirbrakeAerodynamics {
         return dragSurface != null;
     }
 
-    // -----------------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------------
+    // Local Helpers
 
     private static double clamp01(double v) {
         if (v < 0.0) return 0.0;

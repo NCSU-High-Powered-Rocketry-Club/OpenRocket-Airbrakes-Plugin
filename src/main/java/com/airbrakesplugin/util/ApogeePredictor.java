@@ -60,13 +60,11 @@ public final class ApogeePredictor {
 
     // ---------------- Debug trace ------------------
     public interface TraceSink {
-        void onUpdate(double t, double alt, double vWorldZ, double aWorldZ,
-                      double apogeeStrict, double apogeeBestEffort, double uncertainty, int packets, String note);
+        void onUpdate(double t, double alt, double vWorldZ, double aWorldZ, double apogeeStrict, double apogeeBestEffort, double uncertainty, int packets, String note);
     }
     private TraceSink traceSink = null;
     public void setTraceSink(TraceSink sink) { this.traceSink = sink; }
-    private void publishTrace(double t, double alt, double vz, double az,
-                              double apoStrict, double apoBest, double unc, int packets, String note) {
+    private void publishTrace(double t, double alt, double vz, double az, double apoStrict, double apoBest, double unc, int packets, String note) {
         if (traceSink != null) {
             traceSink.onUpdate(t, alt, vz, az, apoStrict, apoBest, unc, packets, note);
         }
@@ -85,13 +83,7 @@ public final class ApogeePredictor {
         );
     }
 
-    public ApogeePredictor(int minPackets,
-                           double flightLengthSeconds,
-                           double integrationDtSeconds,
-                           double gravity,
-                           double uncertaintyThreshold,
-                           double initA,
-                           double initB) {
+    public ApogeePredictor(int minPackets, double flightLengthSeconds, double integrationDtSeconds, double gravity, double uncertaintyThreshold, double initA, double initB) {
         this.APOGEE_PREDICTION_MIN_PACKETS = Math.max(2, minPackets);
         this.FLIGHT_LENGTH_SECONDS         = Math.max(5.0, flightLengthSeconds);
         this.INTEGRATION_DT_SECONDS        = Math.max(1e-4, integrationDtSeconds);
@@ -119,9 +111,11 @@ public final class ApogeePredictor {
 
         // Recompute cumulative time
         final int n = dts.size();
+        
         if (cumulativeTime.length < n) cumulativeTime = new double[n];
         double cumT = 0.0;
         int i = 0;
+        
         for (double dti : dts) {
             cumulativeTime[i++] = cumT;
             cumT += dti;
@@ -143,8 +137,7 @@ public final class ApogeePredictor {
             if (coeffs != null) {
                 A = coeffs.A; B = coeffs.B; uncertainties = coeffs.uncertainties;
                 hasConverged = true;
-                log.debug("[ApoPred] fit: A={} B={} σA={} σB={} N={} T={}s",
-                        fmt(A), fmt(B), fmt(uncertainties[0]), fmt(uncertainties[1]), len, fmt(tFitNow));
+                log.debug("[ApoPred] fit: A={} B={} σA={} σB={} N={} T={}s", fmt(A), fmt(B), fmt(uncertainties[0]), fmt(uncertainties[1]), len, fmt(tFitNow));
 
                 // Build LUT for predictions
                 updatePredictionLookupTable(A, B);
@@ -156,8 +149,7 @@ public final class ApogeePredictor {
                     double apoStrict = (apoStrictObj != null) ? apoStrictObj : Double.NaN;
                     Double apoBestObj = getApogeeBestEffort();
                     double apoBest = (apoBestObj != null) ? apoBestObj : Double.NaN;
-                    publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG,
-                                 apoStrict, apoBest, unc, len, "fit complete");
+                    publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG, apoStrict, apoBest, unc, len, "fit complete");
                 }
             }
             lastRunLength = len;
@@ -256,6 +248,7 @@ public final class ApogeePredictor {
         // Approximate covariance from (J^T J)^{-1} scaled by residual variance
         double H11 = 0, H12 = 0, H22 = 0;
         double rss = 0;
+        
         for (int i = 0; i < t.length; i++) {
             final double ti = t[i];
             final double oneMinusBt = clamp(1.0 - B_est * ti, -5.0, 5.0);

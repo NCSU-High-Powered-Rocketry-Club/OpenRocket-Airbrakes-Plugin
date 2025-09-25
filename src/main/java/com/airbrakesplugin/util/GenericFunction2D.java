@@ -68,6 +68,7 @@ public final class GenericFunction2D {
 
                 raw.add(new Row(M, dep, F));
             }
+            
             if (raw.isEmpty()) throw new IllegalArgumentException("CSV has headers but no valid numeric rows: " + csvPath);
 
             normalizeDeploymentInPlace(raw);        // 0–100 → 0–1 if needed
@@ -129,7 +130,7 @@ public final class GenericFunction2D {
         return out;
     }
 
-    // ---- internals (same as earlier flexible loader) ----
+    // internals (same as earlier flexible loader) 
     private void sanityCheck() {
         if (xs.length < 2 || ys.length < 2) throw new IllegalArgumentException("Grid must be at least 2×2.");
         for (int i = 1; i < xs.length; i++) if (!(xs[i] > xs[i-1])) throw new IllegalArgumentException("Mach axis must increase.");
@@ -141,6 +142,7 @@ public final class GenericFunction2D {
     private static String readNonEmptyLine(BufferedReader br) throws IOException {
         String s; while ((s = br.readLine()) != null) { s = s.trim(); if (!s.isEmpty()) return s; } return null;
     }
+    
     private static boolean isBlank(String s){ return s==null || s.trim().isEmpty(); }
     private static String safeGet(String[] a,int i){ return (i>=0 && i<a.length)?a[i]:null; }
     private static char detectDelimiter(String h){ int c=c(h,','), s=c(h,';'), t=c(h,'\t'); return (c>=s && c>=t)?',':(s>=c && s>=t)?';':'\t'; }
@@ -156,11 +158,13 @@ public final class GenericFunction2D {
     private static Map<String,Integer> headerIndexMap(String[] headers){
         Map<String,Integer> m=new HashMap<>(); for(int i=0;i<headers.length;i++) m.put(clean(headers[i]), i); return m;
     }
+    
     private static int pick(Map<String,Integer> hdr, List<String> names){
         for(String n:names){ Integer idx=hdr.get(clean(n)); if(idx!=null) return idx; }
         for (Map.Entry<String,Integer> e: hdr.entrySet()) for(String n:names) if (e.getKey().contains(clean(n))) return e.getValue();
         throw new IllegalArgumentException("CSV missing column. Need one of: "+names+" | headers="+hdr.keySet());
     }
+    
     private static int pickDragColumn(Map<String,Integer> hdr){
         String best=null;
         for (String k: hdr.keySet()){
@@ -172,6 +176,7 @@ public final class GenericFunction2D {
         if (best==null) throw new IllegalArgumentException("CSV missing drag/force column (not Cd). Headers="+hdr.keySet());
         return hdr.get(best);
     }
+    
     private static String clean(String s){ return s.toLowerCase(Locale.ROOT).trim().replace("%","").replace("_","").replace("-","").replace(" ",""); }
     private static double parseNumber(String s,String name){ try{ return Double.parseDouble(s.trim()); } catch(Exception e){ throw new IllegalArgumentException("Failed to parse '"+name+"': '"+s+"'"); } }
 
@@ -180,24 +185,49 @@ public final class GenericFunction2D {
         for(double x:v){ if(first || x!=prev){ t[k++]=x; prev=x; first=false; } }
         return Arrays.copyOf(t,k);
     }
-    private static int bracket(double[] a,double v){ int n=a.length; if (v<=a[0]) return 0; if (v>=a[n-1]) return n-2;
-        int i=Arrays.binarySearch(a,v); if (i>=0) return (i==n-1)? n-2 : Math.max(0,i);
-        int ip=-i-1; return Math.max(0, Math.min(ip-1, n-2)); }
+    private static int bracket(double[] a,double v) { 
+        int n=a.length; if (v<=a[0]) return 0; 
+        
+        if (v>=a[n-1]) return n-2;
+        int i=Arrays.binarySearch(a,v); 
+        
+        if (i>=0) return (i==n-1)? n-2 : Math.max(0,i);
+        int ip=-i-1; return Math.max(0, Math.min(ip-1, n-2)); 
+    }
+    
     private static double clamp(double v,double lo,double hi){ return (v<lo)?lo: (v>hi?hi:v); }
     private static double lerp(double a,double b,double t){ return a + (b-a)*t; }
 
     private static Double findExact(List<Row> rows,double xm,double yd){ for(Row r:rows) if(r.mach==xm && r.depl==yd) return r.valN; return null; }
     private static double idw(List<Row> rows,double xm,double yd,int K,double p,double eps){
         ArrayList<Node> ns=new ArrayList<>(rows.size());
-        for(Row r:rows){ double dx=xm-r.mach, dy=yd-r.depl, d2=dx*dx+dy*dy; if (d2<=eps*eps) return r.valN; ns.add(new Node(Math.sqrt(d2), r.valN)); }
-        ns.sort(Comparator.comparingDouble(n->n.d)); int use=Math.min(K, ns.size());
-        double wsum=0, vsum=0; for(int i=0;i<use;i++){ Node n=ns.get(i); double w=1.0/Math.pow(n.d+eps, p); wsum+=w; vsum+=w*n.v; }
-        if (wsum==0){ double s=0; for(int i=0;i<use;i++) s+=ns.get(i).v; return s/Math.max(1,use); }
+        for(Row r:rows){ 
+            double dx=xm-r.mach, dy=yd-r.depl, d2=dx*dx+dy*dy; 
+            if (d2<=eps*eps) return r.valN; 
+            ns.add(new Node(Math.sqrt(d2), r.valN)); 
+        }
+        
+        ns.sort(Comparator.comparingDouble(n->n.d)); 
+        int use=Math.min(K, ns.size());
+        
+        double wsum=0, vsum=0; 
+        for(int i=0;i<use;i++){ 
+            Node n=ns.get(i); 
+            double w=1.0/Math.pow(n.d+eps, p); 
+            wsum+=w; vsum+=w*n.v; 
+        }
+
+        if (wsum==0){ double s=0; 
+            for(int i=0;i<use;i++) s+=ns.get(i).v; 
+            return s/Math.max(1,use); }
         return vsum/wsum;
     }
     private static void normalizeDeploymentInPlace(List<Row> rows){
-        double[] a=new double[rows.size()]; for(int i=0;i<rows.size();i++) a[i]=rows.get(i).depl;
-        Arrays.sort(a); double med=a[a.length/2]; if (med>1.01) for(Row r:rows) r.depl/=100.0;
+        double[] a=new double[rows.size()];
+        for(int i=0;i<rows.size();i++) a[i]=rows.get(i).depl;
+        Arrays.sort(a); 
+        double med=a[a.length/2]; 
+        if (med>1.01) for(Row r:rows) r.depl/=100.0;
     }
 
     private static final class Row { final double mach; double depl; final double valN; Row(double m,double d,double v){mach=m;depl=d;valN=v;} }

@@ -46,11 +46,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private static final FlightDataType PRED_APOGEE =
             FlightDataType.getType("predictedApogee", "predictedApogee", UnitGroup.UNITS_DISTANCE);
 
-    public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes,
-                                      AirbrakeController controller,
-                                      ApogeePredictor predictor,
-                                      double airbrakes_areaFallback,   // retained for ctor compatibility (unused here)
-                                      AirbrakeConfig config) {
+    public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes, AirbrakeController controller, ApogeePredictor predictor, double airbrakes_areaFallback, AirbrakeConfig config) {
         this.airbrakes  = airbrakes;
         this.controller = controller;
         this.predictor  = predictor;
@@ -143,13 +139,13 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final Coordinate pos = status.getRocketPosition();
         final double vz = vel.z;
 
-        // --- OpenRocket altitude (MSL) for comparison to apogee (keep this label) ---
+        // OpenRocket altitude (MSL) for comparison to apogee 
         final double OpenRoc_alt = pos.z + status.getSimulationConditions().getLaunchSite().getAltitude();
 
         log.debug("preStep t={} dt={}  pos={}  vel={}  vz={}  OpenRoc_alt(MSL)={}",
                 t, dt, pos, vel, vz, OpenRoc_alt);
 
-        // ---- Predictor update (world-Z acceleration including g) ----
+        // Predictor update (world-Z acceleration including g) 
         if (lastVz != null) {
             final double a_worldZ_incl_g = (vz - lastVz) / dt;
             predictor.update(a_worldZ_incl_g, dt, pos.z, vz);
@@ -157,7 +153,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
         lastVz = vz;
 
-        // ---- Read predictor outputs ----
+        // Read predictor outputs 
         Double apUsed = null;
         try {
             final Double apStrict = predictor.getPredictionIfReady();
@@ -183,7 +179,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.debug("Apogee(pred)=N/A (predictor not ready)");
         }
 
-        // --- Control: if apogee > target → EXTEND; else RETRACT (subject to gates) ---
+        // Control: if apogee > target → EXTEND; else RETRACT (subject to gates) 
         double airbrake_ext; // authoritative for this step (will be forced to 0.0/1.0)
 
         if (isExtensionAllowed(status)) {
@@ -212,11 +208,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     }
 
     @Override
-    public FlightConditions postFlightConditions(SimulationStatus status,
-                                                 FlightConditions fc) throws SimulationException {
+    public FlightConditions postFlightConditions(SimulationStatus status, FlightConditions fc) throws SimulationException {
         this.flightConditions = fc;
-        log.debug("Flight conditions updated - AOA: {}, airbrakes area: {}, rocket area: {}, mach: {}",
-                  fc.getAOA(), config.getReferenceArea(), fc.getRefArea(), fc.getMach());
+        log.debug("Flight conditions updated - AOA: {}, airbrakes area: {}, rocket area: {}, mach: {}", fc.getAOA(), config.getReferenceArea(), fc.getRefArea(), fc.getMach());
         return fc;
     }
 
@@ -225,8 +219,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
      * We compute an equivalent CDAxial from the tabulated ΔDrag [N] so OR's solver consumes it.
      */
     @Override
-    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
-                                                        final AerodynamicForces forces) throws SimulationException {
+    public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status, final AerodynamicForces forces) throws SimulationException {
         // Coast-only / gating guard (matches your policy)
         if (!isExtensionAllowed(status)) {
             log.debug("Extension not allowed, no aerodynamic modifications");
@@ -234,31 +227,32 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
 
         // Latest kinematics
-        final Coordinate vVec   = status.getRocketVelocity();
-        final double     v2     = vVec.length2();
-        final double     speed  = Math.sqrt(v2);
-        final double     vz     = vVec.z; // kept for debugging parity with your snippet
-        final double     mach   =  flightConditions.getMach();
+        final Coordinate vVec = status.getRocketVelocity();
+        final double v2 = vVec.length2();
+        final double speed = Math.sqrt(v2);
+        final double vz = vVec.z; // kept for debugging parity with your snippet
+        final double mach = flightConditions.getMach();
         // Latest environment
         if (flightConditions == null) {
             log.debug("No FlightConditions yet; skipping aero override this step");
             return forces;
         }
-        final double rho     = AirDensity.rhoForDynamicPressure(status.getRocketPosition().z, mach);
-        final double dynP    = 0.5 * rho * v2;
+        final double rho = AirDensity.rhoForDynamicPressure(status.getRocketPosition().z, mach);
+        final double dynP = 0.5 * rho * v2;
         final double airbrakes_area = config.getReferenceArea();
         final double rocket_area = flightConditions.getRefArea();
 
-        // Get latest extension from FDB (you also keep ext in-memory; both are consistent)
+        // Get latest extension from FDB
         final FlightDataBranch fdb = status.getFlightDataBranch();
         double airbrakeExt = fdb.getLast(AIRBRAKE_EXT);
+        
         if (!Double.isFinite(airbrakeExt)) airbrakeExt = this.ext;
         airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0; // enforce 0/1
 
         // Altitude (MSL) for speed-of-sound / Mach inside calculateDragForce
         final double altitudeMSL = status.getRocketPosition().z + status.getSimulationConditions().getLaunchSite().getAltitude();
 
-        // Compute drag from your ΔDrag surface (uses speed magnitude, not just vz)
+        // Compute drag from your ΔDrag surface
         final double dragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
         final double cd_roc = forces.getCDaxial();
         final double dragForceN_roc = cd_roc * dynP * rocket_area;
@@ -271,7 +265,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
 
         double drag_total = dragForceN_roc + dragForceN_airbrakes;
-        final double Cd_total = drag_total / (dynP * rocket_area);
+        final double Cd_total = drag_total / (dynP * (rocket_area + airbrakes_area)); 
+        
         forces.setCDaxial(Cd_total);
 
         // Optional diagnostic: predicted apogee this step

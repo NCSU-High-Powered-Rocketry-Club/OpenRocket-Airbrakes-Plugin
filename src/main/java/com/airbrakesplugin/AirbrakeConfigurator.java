@@ -31,7 +31,7 @@ public class AirbrakeConfigurator
 
         panel.setLayout(new MigLayout("wrap 3", "[right]10[grow,fill]10[]"));
 
-        // --- CFD data CSV path chooser ---
+        // CFD data CSV path chooser
         panel.add(new JLabel("CFD data CSV:"));
         final JTextField pathField = new JTextField(ext.getCfdDataFilePath());
         pathField.getDocument().addDocumentListener(new DocumentListener() {
@@ -39,6 +39,7 @@ public class AirbrakeConfigurator
             @Override public void removeUpdate(DocumentEvent e) { ext.setCfdDataFilePath(pathField.getText()); }
             @Override public void changedUpdate(DocumentEvent e) { ext.setCfdDataFilePath(pathField.getText()); }
         });
+        
         panel.add(pathField, "growx");
         final JButton browse = new JButton("Browse...");
         browse.addActionListener(e -> {
@@ -52,62 +53,60 @@ public class AirbrakeConfigurator
         });
         panel.add(browse, "wrap");
 
-        // --- Airbrake reference area ---
+        // Airbrake reference area
         panel.add(new JLabel("Airbrake area:"));
-        final DoubleModel areaModel =
-                new DoubleModel(ext, "ReferenceArea", UnitGroup.UNITS_AREA, 0);
+        final DoubleModel areaModel = new DoubleModel(ext, "ReferenceArea", UnitGroup.UNITS_AREA, 0);
         final JSpinner areaSpinner = new JSpinner(areaModel.getSpinnerModel());
+        
         areaSpinner.setEditor(new SpinnerEditor(areaSpinner));
         panel.add(areaSpinner);
         panel.add(new UnitSelector(areaModel), "wrap");
 
-        // --- Reference length (characteristic length) ---
+        // Reference length (characteristic length)
         panel.add(new JLabel("Reference length:"));
-        final DoubleModel lengthModel =
-                new DoubleModel(ext, "ReferenceLength", UnitGroup.UNITS_DISTANCE, 0);
+        final DoubleModel lengthModel = new DoubleModel(ext, "ReferenceLength", UnitGroup.UNITS_DISTANCE, 0);
         final JSpinner lengthSpinner = new JSpinner(lengthModel.getSpinnerModel());
+        
         lengthSpinner.setEditor(new SpinnerEditor(lengthSpinner));
         panel.add(lengthSpinner);
         panel.add(new UnitSelector(lengthModel), "wrap");
 
-        // --- Target apogee ---
+        // Target apogee
         panel.add(new JLabel("Target apogee:"));
-        final DoubleModel apogeeModel =
-                new DoubleModel(ext, "TargetApogee", UnitGroup.UNITS_DISTANCE, 0);
+        final DoubleModel apogeeModel = new DoubleModel(ext, "TargetApogee", UnitGroup.UNITS_DISTANCE, 0);
         final JSpinner apogeeSpinner = new JSpinner(apogeeModel.getSpinnerModel());
+       
         apogeeSpinner.setEditor(new SpinnerEditor(apogeeSpinner));
         panel.add(apogeeSpinner);
         panel.add(new UnitSelector(apogeeModel), "wrap");
 
-        // --- Deploy altitude threshold ---
+        // Deploy altitude threshold
         panel.add(new JLabel("Deploy altitude threshold:"));
-        final DoubleModel threshModel =
-                new DoubleModel(ext, "DeployAltitudeThreshold", UnitGroup.UNITS_DISTANCE, 0);
+        final DoubleModel threshModel = new DoubleModel(ext, "DeployAltitudeThreshold", UnitGroup.UNITS_DISTANCE, 0);
         final JSpinner threshSpinner = new JSpinner(threshModel.getSpinnerModel());
+        
         threshSpinner.setEditor(new SpinnerEditor(threshSpinner));
         panel.add(threshSpinner);
         panel.add(new UnitSelector(threshModel), "wrap");
 
-        // --- Max Mach for deployment (dimensionless) ---
+        // Max Mach for deployment
         panel.add(new JLabel("Max Mach for deployment:"));
-        final DoubleModel maxMachModel =
-                new DoubleModel(ext, "MaxMachForDeployment", UnitGroup.UNITS_COEFFICIENT, 0);
+        final DoubleModel maxMachModel = new DoubleModel(ext, "MaxMachForDeployment", UnitGroup.UNITS_COEFFICIENT, 0);
         final JSpinner maxMachSpinner = new JSpinner(maxMachModel.getSpinnerModel());
+        
         maxMachSpinner.setEditor(new SpinnerEditor(maxMachSpinner));
         panel.add(maxMachSpinner, "wrap");
 
-        // --- Apogee tolerance (±) ---
+        // Apogee tolerance (±)
         panel.add(new JLabel("Apogee tolerance (±):"));
-        final DoubleModel tolDoubleModel =
-                new DoubleModel(ext, "ApogeeToleranceMeters", UnitGroup.UNITS_DISTANCE, 0);
+        final DoubleModel tolDoubleModel = new DoubleModel(ext, "ApogeeToleranceMeters", UnitGroup.UNITS_DISTANCE, 0);
         final JSpinner tolSpinner = new JSpinner(tolDoubleModel.getSpinnerModel());
+       
         tolSpinner.setEditor(new SpinnerEditor(tolSpinner));
         panel.add(tolSpinner);
         panel.add(new UnitSelector(tolDoubleModel), "wrap");
 
-        // ==========================================================
-        // Debug group (no OpenRocket BooleanModel/StringModel used)
-        // ==========================================================
+        // Debug group
         final JPanel dbg = new JPanel(new MigLayout("insets 8, wrap 2", "[right]10[grow,fill]"));
         dbg.setBorder(new TitledBorder("Debug"));
 

@@ -1,7 +1,5 @@
 package com.airbrakesplugin;
 
-import java.util.Optional;
-
 /**
  * Configuration container for the air-brake plugin.
  * <p>
@@ -16,7 +14,7 @@ import java.util.Optional;
  */
 public class AirbrakeConfig {
 
-    // ── Core aerodynamic & deployment parameters ────────────────────────────
+    // Core aerodynamic & deployment parameters 
     private String  cfdDataFilePath;
     private double  referenceArea;
     private double  referenceLength;
@@ -27,7 +25,7 @@ public class AirbrakeConfig {
     private double  deployAltitudeThreshold;
     private double  maxMachForDeployment;
 
-    // ── Bang-bang controller options ─────────────────────────────────────────
+    // Bang-bang controller options 
     private boolean alwaysOpenMode;
     private double  alwaysOpenPercentage;
 
@@ -59,9 +57,7 @@ public class AirbrakeConfig {
         this.apogeeToleranceMeters = 5.0;     // default tolerance
     }
 
-    // =====================================================================
-    // Getters & setters (reflection-friendly naming)
-    // =====================================================================
+    // Getters & setters for the entire plugin
     public String getCfdDataFilePath()               { return cfdDataFilePath; }
     public void   setCfdDataFilePath(String path)    { this.cfdDataFilePath = path; }
 
@@ -83,7 +79,7 @@ public class AirbrakeConfig {
     public double getMaxMachForDeployment()          { return maxMachForDeployment; }
     public void   setMaxMachForDeployment(double m)  { this.maxMachForDeployment = m; }
 
-    // ── Bang-bang related ──────────────────────────────────────────────────
+    // Bang-bang related 
     public boolean isAlwaysOpenMode()                { return alwaysOpenMode; }
     public void    setAlwaysOpenMode(boolean b)      { this.alwaysOpenMode = b; }
 
@@ -91,7 +87,7 @@ public class AirbrakeConfig {
     public double  getAlwaysOpenPercentage()         { return alwaysOpenPercentage; }
     public void    setAlwaysOpenPercentage(double pct){ this.alwaysOpenPercentage = clamp01(pct); }
 
-    /** Optional tolerance accessor (controller calls via reflection). */
+    /** Optional tolerance accessor */
     public double getApogeeToleranceMeters() { return apogeeToleranceMeters; }
     public void setApogeeToleranceMeters(double tol) { this.apogeeToleranceMeters = tol; }
 
@@ -122,7 +118,7 @@ public class AirbrakeConfig {
     public boolean isDbgShowConsole() { return dbgShowConsole; }
     public void setDbgShowConsole(boolean v) { this.dbgShowConsole = v; }
 
-    // =====================================================================
+    // Local Helpers and string config
     private static double clamp01(double v) { return Math.max(0.0, Math.min(1.0, v)); }
 
     @Override

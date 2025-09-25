@@ -41,26 +41,15 @@ public final class AirbrakeController {
     private boolean hasSetpoint = false;
     private double currentSetpointU = 0.0;     // 0 or 1
 
-    public AirbrakeController(double targetApogeeMeters,
-                              ApogeePredictor predictor,
-                              ControlContext context) {
+    public AirbrakeController(double targetApogeeMeters, ApogeePredictor predictor, ControlContext context) {
         this(targetApogeeMeters, predictor, context, 0.0, 0.0, 0.0);
     }
 
-    public AirbrakeController(double targetApogeeMeters,
-                              ApogeePredictor predictor,
-                              ControlContext context,
-                              double minCoastSeconds,
-                              double maxCoastSeconds) {
+    public AirbrakeController(double targetApogeeMeters, ApogeePredictor predictor, ControlContext context, double minCoastSeconds, double maxCoastSeconds) {
         this(targetApogeeMeters, predictor, context, minCoastSeconds, maxCoastSeconds, 0.0);
     }
 
-    public AirbrakeController(double targetApogeeMeters,
-                              ApogeePredictor predictor,
-                              ControlContext context,
-                              double minCoastSeconds,
-                              double maxCoastSeconds,
-                              double deadbandMeters) {
+    public AirbrakeController(double targetApogeeMeters, ApogeePredictor predictor, ControlContext context, double minCoastSeconds, double maxCoastSeconds, double deadbandMeters) {
         this.targetApogeeMeters = targetApogeeMeters;
         this.predictor = predictor;
         this.context = context;
@@ -71,8 +60,10 @@ public final class AirbrakeController {
 
     public void setContext(ControlContext ctx) { this.context = ctx; }
     public void setDebugListener(DebugListener dbg) { this.dbg = dbg; }
+    
     public double getTargetApogeeMeters() { return targetApogeeMeters; }
     public double getDeadbandMeters() { return deadband; }
+   
     public void setApogeeDeadbandMeters(double meters) { this.deadband = Math.max(0.0, meters); }
     public void setMinFlipIntervalSec(double s) { /* no-op */ }
 

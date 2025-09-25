@@ -15,11 +15,9 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     private static final Logger log = LoggerFactory.getLogger(AirbrakeExtension.class);
     private final AirbrakeConfig config = new AirbrakeConfig();
 
-    // -------------------------------------------------------------------------
     @Override public String getName() { return "6DOF Airbrake Simulation"; }
     @Override public String getDescription() { return "Adds 6DOF-aware airbrake simulation using CFD ΔCd."; }
 
-    // -------------------------------------------------------------------------
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (config.getCfdDataFilePath() == null || config.getCfdDataFilePath().trim().isEmpty())
@@ -35,34 +33,34 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
 
     private SimulationListener buildListener() {
         try {
-            // 1) Aerobrake aerodynamics (from CFD file)
+            // Aerobrake aerodynamics from CFD file)
             final AirbrakeAerodynamics airbrakes = new AirbrakeAerodynamics(config.getCfdDataFilePath());
 
-            // 2) Predictor
+            // Predictor
             final com.airbrakesplugin.util.ApogeePredictor predictor = new com.airbrakesplugin.util.ApogeePredictor();
 
-            // 3) Minimal bang-bang controller (context will be set by the listener on start)
+            // Minimal bang-bang controller (context will be set by the listener on start)
             final AirbrakeController.ControlContext noopCtx = new AirbrakeController.ControlContext() {
                 @Override public void extend_airbrakes() {}
                 @Override public void retract_airbrakes() {}
                 @Override public void switch_altitude_back_to_pressure() {}
             };
+            
             final AirbrakeController controller =
                     new AirbrakeController(config.getTargetApogee(), predictor, noopCtx);
 
-            // 4) Waterloo-style gating parameters
+            // Gating Parameters 
             final double refAreaFallback = Math.max(1e-9, config.getReferenceArea());
 
-            // 5) Listener
+            // Listener
             return new AirbrakeSimulationListener( airbrakes, controller, predictor, refAreaFallback, config);
         } catch (Exception e) {
             throw new RuntimeException("Failed to create AirbrakeSimulationListener: " + e.getMessage(), e);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Bean-style properties (OpenRocket GUI binds via reflection)
-    // -------------------------------------------------------------------------
+    // Bean-style properties for GUI
+
     public String getCfdDataFilePath() { return config.getCfdDataFilePath(); }
     public void setCfdDataFilePath(String p) { config.setCfdDataFilePath(p); fireChangeEvent(); }
 
@@ -90,7 +88,7 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     public double getApogeeToleranceMeters() { return config.getApogeeToleranceMeters(); }
     public void setApogeeToleranceMeters(double tol) { config.setApogeeToleranceMeters(tol); fireChangeEvent(); }
 
-    // --- Debug options (kept as in your file; not used directly by the listener) ---
+    // Debug options
     private boolean debugEnabled = false;
     private boolean dbgAlwaysOpen = false;
     private double  dbgForcedDeployFrac = 1.0;
