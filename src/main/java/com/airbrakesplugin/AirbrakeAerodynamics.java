@@ -12,15 +12,14 @@ import java.util.Objects;
 /**
  * AirbrakeAerodynamics
  *
- * Interpolates ΔDrag (Newtons) as a function of (Mach, DeploymentFraction).
- * - CSV must contain a full rectangular grid with columns:
- *     Mach, DeploymentPercentage, DeltaDrag_N
- * - Interpolation: bilinear (robust/monotone).
- * - Extrapolation: CONSTANT (edge clamp) by default.
+ * Interpolates absolute airbrake Drag [N] as a function of (Mach, DeploymentFraction).
+ * - CSV: flexible headers (Mach, Deployment*, Drag/Force) per GenericFunction2D.
+ * - Data may be scattered; loader internally builds a rectangular grid (IDW) for bilinear interp.
+ * - Extrapolation: CONSTANT (edge clamp) by default (configurable).
  *
  * Notes:
- * - DeploymentFraction is expected in [0..1]. Values outside are clamped.
- * - All previous Cd/Cm bicubic logic has been removed for reliability.
+ * - DeploymentFraction is expected in [0..1]; values outside are clamped.
+ * - This class returns a FORCE [N], not a coefficient. Convert to ΔCd downstream using OR's q and Aref.
  */
 public final class AirbrakeAerodynamics {
 
@@ -29,8 +28,8 @@ public final class AirbrakeAerodynamics {
     /** Tiny numeric epsilon used for domain nudging when needed. */
     private static final double EPS = 1e-12;
 
-    /** Drag surface in Newtons (ΔDrag_N). */
-    private GenericFunction2D deltaDragSurface;
+    /** Drag surface in Newtons (absolute airbrake drag). */
+    private GenericFunction2D dragSurface;
 
     /** Path kept only for diagnostics/reload if desired. */
     private Path sourceCsv;
@@ -44,30 +43,30 @@ public final class AirbrakeAerodynamics {
         if (csvFilePath.isBlank()) {
             throw new IllegalArgumentException("CSV file path is empty");
         }
-        loadDeltaDragSurface(Path.of(csvFilePath), /*extrap*/ ExtrapolationType.CONSTANT);
+        loadDragSurface(Path.of(csvFilePath), /*extrap*/ ExtrapolationType.CONSTANT);
     }
 
     /**
      * Alternate constructor if you want to pass an already-resolved Path and choose extrapolation.
      */
     public AirbrakeAerodynamics(Path csvPath, ExtrapolationType extrapolation) {
-        loadDeltaDragSurface(csvPath, extrapolation == null ? ExtrapolationType.CONSTANT : extrapolation);
+        loadDragSurface(csvPath, extrapolation == null ? ExtrapolationType.CONSTANT : extrapolation);
     }
 
     /**
-     * (Re)load the ΔDrag surface from CSV.
+     * (Re)load the Drag surface from CSV.
      */
-    public final void loadDeltaDragSurface(Path csvPath, ExtrapolationType extrapolation) {
+    public final void loadDragSurface(Path csvPath, ExtrapolationType extrapolation) {
         Objects.requireNonNull(csvPath, "CSV path must not be null");
         Objects.requireNonNull(extrapolation, "Extrapolation must not be null");
         try {
-            this.deltaDragSurface = GenericFunction2D.fromCsv(csvPath, extrapolation);
+            this.dragSurface = GenericFunction2D.fromCsv(csvPath, extrapolation);
             this.sourceCsv = csvPath;
-            LOG.info("Loaded airbrake ΔDrag surface: {} (extrapolation: {})", csvPath, extrapolation);
+            LOG.info("Loaded airbrake Drag surface: {} (extrapolation: {})", csvPath, extrapolation);
         } catch (Exception e) {
-            LOG.error("Failed to load ΔDrag surface from {}: {}", csvPath, e.toString());
+            LOG.error("Failed to load Drag surface from {}: {}", csvPath, e.toString());
             throw (e instanceof IllegalArgumentException) ? (IllegalArgumentException) e
-                    : new IllegalArgumentException("Cannot load ΔDrag surface: " + csvPath, e);
+                    : new IllegalArgumentException("Cannot load Drag surface: " + csvPath, e);
         }
     }
 
@@ -76,15 +75,15 @@ public final class AirbrakeAerodynamics {
     // -----------------------------------------------------------------------------
 
     /**
-     * Interpolate ΔDrag (Newtons) at the given Mach and deployment fraction.
+     * Interpolate absolute airbrake Drag [N] at the given Mach and deployment fraction.
      *
      * @param mach         Freestream Mach number (finite; will be clamped at grid edges).
      * @param deployFrac   Deployment fraction in [0..1] (will be clamped).
-     * @return ΔDrag in Newtons (>= 0 typically), or 0.0 if the surface is not loaded.
+     * @return Drag in Newtons (>= 0 typically), or 0.0 if the surface is not loaded.
      */
-    public double getDeltaDragN(double mach, double deployFrac) {
-        if (deltaDragSurface == null) {
-            LOG.warn("ΔDrag surface not loaded; returning 0 N");
+    public double getAirbrakeDragN(double mach, double deployFrac) {
+        if (dragSurface == null) {
+            LOG.warn("Drag surface not loaded; returning 0 N");
             return 0.0;
         }
         if (!Double.isFinite(mach)) {
@@ -100,10 +99,10 @@ public final class AirbrakeAerodynamics {
         dep = nudge(dep, 0.0, 1.0);
 
         try {
-            double val = deltaDragSurface.value(mach, dep);
-            if (Double.isFinite(val)) return val;
+            double valN = dragSurface.dragN(mach, dep);
+            if (Double.isFinite(valN)) return Math.max(0.0, valN);
         } catch (Exception ex) {
-            LOG.debug("ΔDrag interpolation failed at Mach={}, Deploy={} from {}: {}",
+            LOG.debug("Drag interpolation failed at Mach={}, Deploy={} from {}: {}",
                     mach, dep, sourceCsv, ex.toString());
         }
         return 0.0;
@@ -111,12 +110,12 @@ public final class AirbrakeAerodynamics {
 
     /**
      * Convenience wrapper used by the SimulationListener:
-     * computes Mach from (speed, altitudeMSL) and returns ΔDrag [N] for the given deployment.
+     * computes Mach from (speed, altitudeMSL) and returns Drag [N] for the given deployment.
      *
      * @param deploymentFrac  deployment fraction [0..1]
      * @param speed           speed magnitude [m/s]
      * @param altitudeMSL     altitude above mean sea level [m]
-     * @return ΔDrag in Newtons
+     * @return Drag in Newtons
      */
     public double calculateDragForce(double deploymentFrac, double speed, double altitudeMSL) {
         if (!isReady()) return 0.0;
@@ -125,16 +124,16 @@ public final class AirbrakeAerodynamics {
 
         final double mach = AirDensity.machFromV(speed, altitudeMSL);
         final double dep  = clamp01(deploymentFrac);
-        final double dN   = getDeltaDragN(mach, dep);
+        final double FN   = getAirbrakeDragN(mach, dep);
 
-        LOG.trace("calculateDragForce: M={} dep={} → ΔDrag={} N (speed={}, altMSL={})",
-                mach, dep, dN, speed, altitudeMSL);
-        return dN;
+        LOG.trace("calculateDragForce: M={} dep={} → Drag={} N (speed={} m/s, altMSL={} m)",
+                mach, dep, FN, speed, altitudeMSL);
+        return FN;
     }
 
-    /** @return true if the ΔDrag surface is loaded. */
+    /** @return true if the Drag surface is loaded. */
     public boolean isReady() {
-        return deltaDragSurface != null;
+        return dragSurface != null;
     }
 
     // -----------------------------------------------------------------------------
@@ -154,3 +153,4 @@ public final class AirbrakeAerodynamics {
         return v;
     }
 }
+

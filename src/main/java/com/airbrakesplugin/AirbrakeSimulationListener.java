@@ -49,7 +49,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes,
                                       AirbrakeController controller,
                                       ApogeePredictor predictor,
-                                      double refAreaFallback,   // retained for ctor compatibility (unused here)
+                                      double airbrakes_areaFallback,   // retained for ctor compatibility (unused here)
                                       AirbrakeConfig config) {
         this.airbrakes  = airbrakes;
         this.controller = controller;
@@ -215,8 +215,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     public FlightConditions postFlightConditions(SimulationStatus status,
                                                  FlightConditions fc) throws SimulationException {
         this.flightConditions = fc;
-        log.debug("Flight conditions updated - AOA: {}, refArea: {}, mach: {}",
-                  fc.getAOA(), fc.getRefArea(), fc.getMach());
+        log.debug("Flight conditions updated - AOA: {}, airbrakes area: {}, rocket area: {}, mach: {}",
+                  fc.getAOA(), config.getReferenceArea(), fc.getRefArea(), fc.getMach());
         return fc;
     }
 
@@ -238,15 +238,16 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double     v2     = vVec.length2();
         final double     speed  = Math.sqrt(v2);
         final double     vz     = vVec.z; // kept for debugging parity with your snippet
-
+        final double     mach   =  flightConditions.getMach();
         // Latest environment
         if (flightConditions == null) {
             log.debug("No FlightConditions yet; skipping aero override this step");
             return forces;
         }
-        final double rho     = flightConditions.getAtmosphericConditions().getDensity();
+        final double rho     = AirDensity.rhoForDynamicPressure(status.getRocketPosition().z, mach);
         final double dynP    = 0.5 * rho * v2;
-        final double refArea = flightConditions.getRefArea();
+        final double airbrakes_area = config.getReferenceArea();
+        final double rocket_area = flightConditions.getRefArea();
 
         // Get latest extension from FDB (you also keep ext in-memory; both are consistent)
         final FlightDataBranch fdb = status.getFlightDataBranch();
@@ -255,33 +256,30 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0; // enforce 0/1
 
         // Altitude (MSL) for speed-of-sound / Mach inside calculateDragForce
-        final double altitudeMSL = status.getRocketPosition().z
-                + status.getSimulationConditions().getLaunchSite().getAltitude();
+        final double altitudeMSL = status.getRocketPosition().z + status.getSimulationConditions().getLaunchSite().getAltitude();
 
         // Compute drag from your ΔDrag surface (uses speed magnitude, not just vz)
-        final double dragForceN = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
-        log.debug("ΔDrag = {} N at ext={}  (speed={} m/s, vz={} m/s, altMSL={})",
-                  dragForceN, airbrakeExt, speed, vz, altitudeMSL);
+        final double dragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
+        final double cd_roc = forces.getCDaxial();
+        final double dragForceN_roc = cd_roc * dynP * rocket_area;
 
-        if (dynP <= 0 || refArea <= 0) {
-            log.debug("dynP={} or refArea={} non-positive; skipping aero override", dynP, refArea);
+        log.debug("Airbrakes Drag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={})", dragForceN_airbrakes, airbrakeExt, dragForceN_roc, speed, vz, altitudeMSL);
+
+        if (dynP <= 0 || airbrakes_area <= 0) {
+            log.debug("dynP={} or airbrakes_area={} non-positive; skipping aero override", dynP, airbrakes_area);
             return forces;
         }
 
-        // Convert force → equivalent CDAxial for OR
-        final double cDAxial = dragForceN / (dynP * refArea);
-
-        // Note: this "CDAxial" is an equivalent scalar for solver compatibility
-        // (AOA effects small per your experiments)
-        final double oldCd = forces.getCDaxial();
-        forces.setCDaxial(cDAxial);
+        double drag_total = dragForceN_roc + dragForceN_airbrakes;
+        final double Cd_total = drag_total / (dynP * rocket_area);
+        forces.setCDaxial(Cd_total);
 
         // Optional diagnostic: predicted apogee this step
         final double ap = fdb.getLast(PRED_APOGEE);
         if (Double.isFinite(ap)) {
-            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)={} m", cDAxial, oldCd, ap);
+            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)={} m", Cd_total, cd_roc, ap);
         } else {
-            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)=N/A", cDAxial, oldCd);
+            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)=N/A", Cd_total, cd_roc);
         }
 
         return forces;
