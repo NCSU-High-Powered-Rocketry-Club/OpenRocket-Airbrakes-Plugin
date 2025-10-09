@@ -265,7 +265,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
 
         double drag_total = dragForceN_roc + dragForceN_airbrakes;
-        final double Cd_total = drag_total / (dynP * rocket_area); 
+        final double Cd_total = drag_total / (dynP * rocket_area * airbrakes_area);
         
         forces.setCDaxial(Cd_total);
 
