@@ -139,13 +139,23 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final Coordinate pos = status.getRocketPosition();
         final double vz = vel.z;
 
-        // OpenRocket altitude (MSL) for comparison to apogee 
+        // OpenRocket altitude (MSL) for comparison to apogee
         final double OpenRoc_alt = pos.z + status.getSimulationConditions().getLaunchSite().getAltitude();
 
         log.debug("preStep t={} dt={}  pos={}  vel={}  vz={}  OpenRoc_alt(MSL)={}",
                 t, dt, pos, vel, vz, OpenRoc_alt);
 
-        // Predictor update (world-Z acceleration including g) 
+        // --- Capture burnout time here as well (so override mode has it even if we skip gates) ---
+        final FlightDataBranch fdb = status.getFlightDataBranch();
+        if (burnoutTimeS == null) {
+            final double thrustN = fdb.getLast(FlightDataType.TYPE_THRUST_FORCE);
+            if (thrustN <= 0.0) {
+                burnoutTimeS = t;
+                log.debug("Captured burnout time (preStep): {} s", burnoutTimeS);
+            }
+        }
+
+        // Predictor update (world-Z acceleration including g)
         if (lastVz != null) {
             final double a_worldZ_incl_g = (vz - lastVz) / dt;
             predictor.update(a_worldZ_incl_g, dt, pos.z, vz);
@@ -153,7 +163,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
         lastVz = vz;
 
-        // Read predictor outputs 
+        // Read predictor outputs
         Double apUsed = null;
         try {
             final Double apStrict = predictor.getPredictionIfReady();
@@ -169,7 +179,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
 
         // Publish predicted apogee (NaN if not ready)
-        final FlightDataBranch fdb = status.getFlightDataBranch();
         fdb.setValue(PRED_APOGEE, apUsed != null ? apUsed : Double.NaN);
 
         if (apUsed != null) {
@@ -179,7 +188,31 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.debug("Apogee(pred)=N/A (predictor not ready)");
         }
 
-        // Control: if apogee > target → EXTEND; else RETRACT (subject to gates) 
+        // --- NEW: Burnout-only override (kept minimal; returns early when active) ---
+        if (config != null && config.isDeployAfterBurnoutOnly()) {
+            final double delay = Math.max(0.0, config.getDeployAfterBurnoutDelayS());
+            double airbrake_ext_override;
+            if (burnoutTimeS == null) {
+                // Still burning → keep retracted
+                airbrake_ext_override = 0.0;
+                log.debug("Override active: waiting for burnout");
+            } else {
+                final double dtSinceBurnout = t - burnoutTimeS;
+                if (dtSinceBurnout >= delay) {
+                    airbrake_ext_override = 1.0; // force full deploy after burnout+delay
+                    log.debug("Override active: burnout+delay reached (dtSinceBurnout={} >= delay={}) → EXTEND", dtSinceBurnout, delay);
+                } else {
+                    airbrake_ext_override = 0.0; // still within delay window
+                    log.debug("Override active: within delay (dtSinceBurnout={} < delay={}) → RETRACT", dtSinceBurnout, delay);
+                }
+            }
+            airbrake_ext_override = (airbrake_ext_override >= 0.5) ? 1.0 : 0.0;
+            this.ext = airbrake_ext_override;
+            fdb.setValue(AIRBRAKE_EXT, this.ext);
+            return true; // skip normal controller/predictor path
+        }
+
+        // Control: if apogee > target → EXTEND; else RETRACT (subject to gates)
         double airbrake_ext; // authoritative for this step (will be forced to 0.0/1.0)
 
         if (isExtensionAllowed(status)) {
@@ -220,9 +253,15 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
      */
     @Override
     public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status, final AerodynamicForces forces) throws SimulationException {
-        // Coast-only / gating guard (matches your policy)
-        if (!isExtensionAllowed(status)) {
-            log.debug("Extension not allowed, no aerodynamic modifications");
+        // --- Keep original gating, but allow aero when override is "active now" ---
+        boolean overrideActiveNow = false;
+        if (config != null && config.isDeployAfterBurnoutOnly() && burnoutTimeS != null) {
+            final double delay = Math.max(0.0, config.getDeployAfterBurnoutDelayS());
+            final double dtSinceBurnout = status.getSimulationTime() - burnoutTimeS;
+            overrideActiveNow = (dtSinceBurnout >= delay);
+        }
+        if (!(overrideActiveNow || isExtensionAllowed(status))) {
+            log.debug("Extension not allowed (and override not active), no aerodynamic modifications");
             return forces;
         }
 
@@ -245,7 +284,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         // Get latest extension from FDB
         final FlightDataBranch fdb = status.getFlightDataBranch();
         double airbrakeExt = fdb.getLast(AIRBRAKE_EXT);
-        
+
         if (!Double.isFinite(airbrakeExt)) airbrakeExt = this.ext;
         airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0; // enforce 0/1
 
@@ -266,7 +305,7 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         double drag_total = dragForceN_roc + dragForceN_airbrakes;
         final double Cd_total = drag_total / (dynP * (rocket_area + airbrakes_area));
-        
+
         forces.setCDaxial(Cd_total);
 
         // Optional diagnostic: predicted apogee this step

@@ -88,6 +88,12 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     public double getApogeeToleranceMeters() { return config.getApogeeToleranceMeters(); }
     public void setApogeeToleranceMeters(double tol) { config.setApogeeToleranceMeters(tol); fireChangeEvent(); }
 
+    // Burnout-only option (mirrors AirbrakeConfig)
+    public boolean isDeployAfterBurnoutOnly() { return config.isDeployAfterBurnoutOnly(); }
+    public void setDeployAfterBurnoutOnly(boolean v) { config.setDeployAfterBurnoutOnly(v); fireChangeEvent(); }
+    public double getDeployAfterBurnoutDelayS() { return config.getDeployAfterBurnoutDelayS(); }
+    public void setDeployAfterBurnoutDelayS(double s) { config.setDeployAfterBurnoutDelayS(Math.max(0.0, s)); fireChangeEvent(); }
+
     // Debug options
     private boolean debugEnabled = false;
     private boolean dbgAlwaysOpen = false;

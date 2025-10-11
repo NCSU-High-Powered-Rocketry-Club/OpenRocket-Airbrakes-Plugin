@@ -14,7 +14,7 @@ package com.airbrakesplugin;
  */
 public class AirbrakeConfig {
 
-    // Core aerodynamic & deployment parameters 
+    // Core aerodynamic & deployment parameters
     private String  cfdDataFilePath;
     private double  referenceArea;
     private double  referenceLength;
@@ -25,9 +25,15 @@ public class AirbrakeConfig {
     private double  deployAltitudeThreshold;
     private double  maxMachForDeployment;
 
-    // Bang-bang controller options 
+    // Bang-bang controller options
     private boolean alwaysOpenMode;
     private double  alwaysOpenPercentage;
+
+    // === Burnout-only deploy option ===
+    /** If true, ignore apogee prediction and deploy only after burnout with a delay. */
+    private boolean deployAfterBurnoutOnly = false;
+    /** Seconds to wait after burnout before forcing full deploy (>= 0). */
+    private double deployAfterBurnoutDelayS = 0.0;
 
     // Debug
     private boolean debugEnabled = false;
@@ -40,21 +46,25 @@ public class AirbrakeConfig {
     private boolean dbgShowConsole = false;
     /** ±dead-band around set-point [m]; if {@code null} → default in controller. */
     private Double  apogeeToleranceMeters;
-    
+
     /**
      * Constructor with default values.
      */
     public AirbrakeConfig() {
         this.referenceArea = 0.0;            // m²
         this.referenceLength = 0.0;          // m
-        this.maxDeploymentRate = 40.0;        // 1/s (fraction per second)
-        this.targetApogee = 0.0;           // m AGL
-        this.deployAltitudeThreshold = 0.0;   // m AGL – prevent ground tests
+        this.maxDeploymentRate = 40.0;       // 1/s (fraction per second)
+        this.targetApogee = 0.0;             // m AGL
+        this.deployAltitudeThreshold = 0.0;  // m AGL – prevent ground tests
         this.maxMachForDeployment = 1.0;     // cap for supersonic
         this.alwaysOpenMode = false;
         this.alwaysOpenPercentage = 1;       // 0–1
         this.apogeeToleranceMeters = null;
-        this.apogeeToleranceMeters = 5.0;     // default tolerance
+        this.apogeeToleranceMeters = 5.0;    // default tolerance
+
+        // Burnout-only deploy defaults (already set via field initializers)
+        // this.deployAfterBurnoutOnly = false;
+        // this.deployAfterBurnoutDelayS = 0.0;
     }
 
     // Getters & setters for the entire plugin
@@ -79,13 +89,27 @@ public class AirbrakeConfig {
     public double getMaxMachForDeployment()          { return maxMachForDeployment; }
     public void   setMaxMachForDeployment(double m)  { this.maxMachForDeployment = m; }
 
-    // Bang-bang related 
+    // Bang-bang related
     public boolean isAlwaysOpenMode()                { return alwaysOpenMode; }
     public void    setAlwaysOpenMode(boolean b)      { this.alwaysOpenMode = b; }
 
     /** Alias used by controller via reflection. */
     public double  getAlwaysOpenPercentage()         { return alwaysOpenPercentage; }
     public void    setAlwaysOpenPercentage(double pct){ this.alwaysOpenPercentage = clamp01(pct); }
+
+    // Burnout-only deploy option
+    public boolean isDeployAfterBurnoutOnly() {
+        return deployAfterBurnoutOnly;
+    }
+    public void setDeployAfterBurnoutOnly(boolean deployAfterBurnoutOnly) {
+        this.deployAfterBurnoutOnly = deployAfterBurnoutOnly;
+    }
+    public double getDeployAfterBurnoutDelayS() {
+        return deployAfterBurnoutDelayS;
+    }
+    public void setDeployAfterBurnoutDelayS(double deployAfterBurnoutDelayS) {
+        this.deployAfterBurnoutDelayS = Math.max(0.0, deployAfterBurnoutDelayS);
+    }
 
     /** Optional tolerance accessor */
     public double getApogeeToleranceMeters() { return apogeeToleranceMeters; }
@@ -134,6 +158,8 @@ public class AirbrakeConfig {
                 ", alwaysOpenMode=" + alwaysOpenMode +
                 ", alwaysOpenPercentage=" + alwaysOpenPercentage +
                 ", apogeeToleranceMeters=" + apogeeToleranceMeters +
+                ", deployAfterBurnoutOnly=" + deployAfterBurnoutOnly +
+                ", deployAfterBurnoutDelayS=" + deployAfterBurnoutDelayS +
                 "}";
     }
 }
