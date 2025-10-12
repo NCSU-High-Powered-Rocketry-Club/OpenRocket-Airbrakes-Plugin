@@ -305,13 +305,21 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         double drag_total = dragForceN_roc + dragForceN_airbrakes;
         final double Cd_total = drag_total / (dynP * (rocket_area + airbrakes_area));
-
+        
         forces.setCDaxial(Cd_total);
+
+        // if (airbrakeExt == 0.0) {
+        //     forces.setCDaxial(cd_roc);
+        // } else {
+        //     forces.setCDaxial(Cd_total);
+        // }
 
         // Optional diagnostic: predicted apogee this step
         final double ap = fdb.getLast(PRED_APOGEE);
         if (Double.isFinite(ap)) {
             log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)={} m", Cd_total, cd_roc, ap);
+        } else if (airbrakeExt == 0.0) {
+            log.debug("PostAero: set CDaxial={} (Extension at 0%), Current CD={}", cd_roc, Cd_total);
         } else {
             log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)=N/A", Cd_total, cd_roc);
         }
