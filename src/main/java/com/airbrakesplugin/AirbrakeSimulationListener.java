@@ -293,35 +293,34 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         // Compute drag from your ΔDrag surface
         final double dragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
-        final double cd_roc = forces.getCDaxial();
+        final double cd_roc_axial = forces.getCDaxial();
+        final double dragForceN_roc_axial = cd_roc_axial * dynP * rocket_area;
+        
+        final double cd_roc = forces.getCD();
         final double dragForceN_roc = cd_roc * dynP * rocket_area;
 
-        log.debug("Airbrakes Drag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={})", dragForceN_airbrakes, airbrakeExt, dragForceN_roc, speed, vz, altitudeMSL);
+        log.debug("Airbrakes Drag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={})", dragForceN_airbrakes, airbrakeExt, dragForceN_roc_axial, speed, vz, altitudeMSL);
 
         if (dynP <= 0 || airbrakes_area <= 0) {
             log.debug("dynP={} or airbrakes_area={} non-positive; skipping aero override", dynP, airbrakes_area);
             return forces;
         }
 
+        double drag_total_axial = dragForceN_roc_axial + dragForceN_airbrakes;
         double drag_total = dragForceN_roc + dragForceN_airbrakes;
+
+        final double Cd_total_axial = drag_total_axial / (dynP * (rocket_area + airbrakes_area));
         final double Cd_total = drag_total / (dynP * (rocket_area + airbrakes_area));
         
-        forces.setCDaxial(Cd_total);
-
-        // if (airbrakeExt == 0.0) {
-        //     forces.setCDaxial(cd_roc);
-        // } else {
-        //     forces.setCDaxial(Cd_total);
-        // }
+        forces.setCDaxial(Cd_total_axial);
+        forces.setCD(Cd_total);
 
         // Optional diagnostic: predicted apogee this step
         final double ap = fdb.getLast(PRED_APOGEE);
         if (Double.isFinite(ap)) {
-            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)={} m", Cd_total, cd_roc, ap);
-        } else if (airbrakeExt == 0.0) {
-            log.debug("PostAero: set CDaxial={} (Extension at 0%), Current CD={}", cd_roc, Cd_total);
+            log.debug("PostAero: set CDaxial={} (was {}), set CD={} (was {}), Apogee(pred)={} m", Cd_total_axial, cd_roc_axial, Cd_total, cd_roc, ap);
         } else {
-            log.debug("PostAero: set CDaxial={} (was {}), Apogee(pred)=N/A", Cd_total, cd_roc);
+            log.debug("PostAero: set CDaxial={} (was {}), set CD={} (was {}), Apogee(pred)=N/A", Cd_total_axial, cd_roc_axial, Cd_total, cd_roc);
         }
 
         return forces;
