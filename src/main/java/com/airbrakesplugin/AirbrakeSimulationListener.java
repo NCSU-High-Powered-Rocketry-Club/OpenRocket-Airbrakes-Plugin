@@ -158,8 +158,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         // Predictor update (world-Z acceleration including g)
         if (lastVz != null) {
             final double a_worldZ_incl_g = (vz - lastVz) / dt;
-            predictor.update(a_worldZ_incl_g, dt, pos.z, vz);
-            log.debug("Predictor updated: az={} lastVz={}", a_worldZ_incl_g, lastVz);
+            // ***** UPDATED: pass both AGL and MSL to the RK4 predictor *****
+            predictor.update(a_worldZ_incl_g, dt, pos.z, OpenRoc_alt, vz);
+            log.debug("Predictor updated: az={} lastVz={} zAGL={} zMSL={}", a_worldZ_incl_g, lastVz, pos.z, OpenRoc_alt);
         }
         lastVz = vz;
 

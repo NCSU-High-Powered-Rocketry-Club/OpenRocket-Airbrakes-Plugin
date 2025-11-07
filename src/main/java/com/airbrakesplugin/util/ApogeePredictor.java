@@ -1,386 +1,156 @@
 package com.airbrakesplugin.util;
 
+import com.airbrakesplugin.util.AirDensity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayDeque;
-import java.util.Arrays;
-import java.util.Deque;
-
 /**
- * Lightweight, self-contained apogee predictor.
+ * RK4-based apogee predictor.
  *
- * Model (coast only): a(t) = A * (1 - B t)^4   where a is world-Z acceleration INCLUDING g.
+ * Integrates a vertical point-mass with quadratic drag using 4th-order Runge–Kutta:
  *
- * How it works
- * 1) As samples arrive, fit A,B to the recent acceleration-vs-time using Gauss–Newton with light
- *    Levenberg–Marquardt damping. Enforce A <= 0 (downward accel in +Z), B >= 0.
- * 2) From the CURRENT state (altitude, vertical velocity), integrate the fitted model forward in time:
- *       v_{i+1} = v_i + a_model(t_i) * dt
- *       h_{i+1} = h_i + v_{i+1} * dt
- *    until apogee (max(h)) is reached.
- * 3) Build a lookup table of ΔH = H_apogee − H(t) against the ascending velocities v(t) in [0, v_current].
- *    Apogee estimate = currentAltitude + ΔH at currentVelocity (1D linear interpolation).
+ *   dz/dt = v
+ *   dv/dt = -g - k(z) * v * |v|
  *
- * Two outputs:
- *  - {@link #getApogeeBestEffort()}  : available as soon as a LUT can be built (>=2 points).
- *  - {@link #getPredictionIfReady()} : same, but only when the fit uncertainties are small enough.
+ * k(z) is density-scaled: k(z) = k_now * (rho(z)/rho_now), where k_now is calibrated
+ * from the current measured vertical acceleration (including g):
+ *
+ *   a_meas ≈ -g - k_now * v*|v|  →  k_now = max(0, -(a_meas + g)/(v*|v|))
+ *
+ * Units: meters, seconds. Returns apogee altitude above MSL to match OpenRocket.
  */
 public final class ApogeePredictor {
-    private static final Logger log = LoggerFactory.getLogger(ApogeePredictor.class);
 
-    // ---------------- Configuration ----------------
-    private final int    APOGEE_PREDICTION_MIN_PACKETS;
-    private final double FLIGHT_LENGTH_SECONDS;
-    private final double INTEGRATION_DT_SECONDS;
-    private final double GRAVITY_MPS2;
-    private final double UNCERTAINTY_THRESHOLD;
-    private final double INIT_A;
-    private final double INIT_B;
-    private final int    MAX_ITERS = 60;
-    private final double LM_LAMBDA = 1e-3;
+    private static final Logger LOG = LoggerFactory.getLogger(ApogeePredictor.class);
 
-    // ---------------- State (inputs) ---------------
-    private final Deque<Double> accelerations = new ArrayDeque<>(); // includes gravity
-    private final Deque<Double> dts           = new ArrayDeque<>();
-    private double[] cumulativeTime = new double[0];
+    // Constants
+    private static final double G = 9.80665;     // m/s^2
+    private static final double MIN_V = 0.01;    // m/s → consider "at apogee"
+    private static final int    DEFAULT_STEPS = 30;
+    private static final double MIN_DT = 1e-3;
+    private static final double MAX_DT = 0.1;    // sec per RK4 substep cap
 
-    private double currentAltitude = 0.0;
-    private double currentVelocity = 0.0;
-    private double tFitNow = 0.0;
+    // Config
+    private int rk4Steps = DEFAULT_STEPS;
 
-    // ---------------- State (fit & LUT) ------------
-    private boolean hasConverged = false;
-    private int     lastRunLength = 0;
-    private double  A = -9.0, B = 0.05;
-    private double[] uncertainties = new double[] { Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY };
+    // Last prediction
+    private Double lastApogeeMSL = null;
 
-    private double[] lutVelocities   = null;  // ascending v (m/s)
-    private double[] lutDeltaHeights = null;  // ΔH to apogee (m)
+    public ApogeePredictor() { }
 
-    // ---------------- Debug trace ------------------
-    public interface TraceSink {
-        void onUpdate(double t, double alt, double vWorldZ, double aWorldZ, double apogeeStrict, double apogeeBestEffort, double uncertainty, int packets, String note);
+    /** Tune number of RK4 substeps per update (default ~30). */
+    public void setRk4Steps(int steps) {
+        if (steps >= 5 && steps <= 200) this.rk4Steps = steps;
     }
-    private TraceSink traceSink = null;
-    public void setTraceSink(TraceSink sink) { this.traceSink = sink; }
-    private void publishTrace(double t, double alt, double vz, double az, double apoStrict, double apoBest, double unc, int packets, String note) {
-        if (traceSink != null) {
-            traceSink.onUpdate(t, alt, vz, az, apoStrict, apoBest, unc, packets, note);
+
+    /** Reset (clears last prediction). */
+    public void reset() { lastApogeeMSL = null; }
+
+    /**
+     * Update and produce a new apogee estimate.
+     *
+     * @param a_worldZ_includingG   measured vertical accel (includes g), m/s^2
+     * @param dtSim                 outer simulation dt, s (used to size look-ahead step)
+     * @param altitudeAGL           current altitude AGL (OpenRocket z), m
+     * @param altitudeMSL           current altitude MSL (z + site altitude), m
+     * @param vZ                    vertical velocity (world-Z), m/s
+     */
+    public void update(double a_worldZ_includingG,
+                       double dtSim,
+                       double altitudeAGL,
+                       double altitudeMSL,
+                       double vZ) {
+
+        // If descending / nearly stopped: apogee is now.
+        if (!Double.isFinite(vZ) || vZ <= 0.0 || Math.abs(vZ) < MIN_V) {
+            lastApogeeMSL = altitudeMSL;
+            return;
         }
-    }
-
-    // ------------- Constructors --------------------
-    public ApogeePredictor() {
-        this(
-            /*minPackets*/   5,  // Lowered for faster readiness
-            /*flightLen*/    120.0,
-            /*dt*/           0.01,
-            /*g*/            9.80665,
-            /*uncert*/       0.25,
-            /*initA*/        -9.0,
-            /*initB*/        0.05
-        );
-    }
-
-    public ApogeePredictor(int minPackets, double flightLengthSeconds, double integrationDtSeconds, double gravity, double uncertaintyThreshold, double initA, double initB) {
-        this.APOGEE_PREDICTION_MIN_PACKETS = Math.max(2, minPackets);
-        this.FLIGHT_LENGTH_SECONDS         = Math.max(5.0, flightLengthSeconds);
-        this.INTEGRATION_DT_SECONDS        = Math.max(1e-4, integrationDtSeconds);
-        this.GRAVITY_MPS2                  = gravity;
-        this.UNCERTAINTY_THRESHOLD         = Math.max(1e-8, uncertaintyThreshold);
-        this.INIT_A                        = (initA > 0) ? -Math.abs(initA) : initA;
-        this.INIT_B                        = Math.max(0.0, initB);
-    }
-
-    // ------------- Public API ----------------------
-
-    /** Feed **coast** samples: world-Z acceleration INCLUDING g, time step (s), altitude (m), vertical velocity (m/s). */
-    public void update(double verticalAcceleration_includingG, double dt, double altitude, double verticalVelocity) {
-        // Skip if accel positive (safety for non-coast phases)
-        if (verticalAcceleration_includingG > 0.0) {
-            log.warn("[ApoPred] skipped update: positive accel {} (non-coast?)", verticalAcceleration_includingG);
+        if (!Double.isFinite(a_worldZ_includingG)) {
+            // Ballistic fallback (no drag) if accel is unavailable.
+            lastApogeeMSL = altitudeMSL + (vZ * vZ) / (2.0 * G);
             return;
         }
 
-        currentAltitude = altitude;
-        currentVelocity = verticalVelocity;
+        // Calibrate drag coefficient at "now": a = -g - k_now*v|v|
+        final double denom = vZ * Math.abs(vZ);
+        double k_now = denom != 0.0 ? -(a_worldZ_includingG + G) / denom : 0.0;
+        if (!Double.isFinite(k_now) || k_now < 0.0) k_now = 0.0;
 
-        accelerations.addLast(verticalAcceleration_includingG);
-        dts.addLast(Math.max(1e-6, dt));
+        final double rho_now = AirDensity.rhoISA(altitudeMSL);
 
-        // Recompute cumulative time
-        final int n = dts.size();
-        
-        if (cumulativeTime.length < n) cumulativeTime = new double[n];
-        double cumT = 0.0;
-        int i = 0;
-        
-        for (double dti : dts) {
-            cumulativeTime[i++] = cumT;
-            cumT += dti;
-        }
-        tFitNow = cumT;
+        // Use ~30 fixed substeps unless constrained by safety caps.
+        final double t_no_drag = vZ / G; // time to apogee ignoring drag
+        double dt = Math.max(MIN_DT, Math.min(MAX_DT, Math.abs(t_no_drag) / Math.max(1, rk4Steps)));
+        int steps = rk4Steps;
 
-        // Trim to recent history if too long (optional cap, e.g., last 1000)
-        while (accelerations.size() > 1000) {
-            accelerations.removeFirst();
-            dts.removeFirst();
-        }
+        double z = altitudeMSL;
+        double v = vZ;
+        double zPrev = z, vPrev = v;
+        boolean crossed = false;
 
-        // Fit if enough points
-        final int len = accelerations.size();
-        if (len >= APOGEE_PREDICTION_MIN_PACKETS && len != lastRunLength) {
-            final double[] a = toArray(accelerations);
-            final double[] t = Arrays.copyOf(cumulativeTime, len);
-            final CurveCoefficients coeffs = fitCurve(a, t);
-            if (coeffs != null) {
-                A = coeffs.A; B = coeffs.B; uncertainties = coeffs.uncertainties;
-                hasConverged = true;
-                log.debug("[ApoPred] fit: A={} B={} σA={} σB={} N={} T={}s", fmt(A), fmt(B), fmt(uncertainties[0]), fmt(uncertainties[1]), len, fmt(tFitNow));
+        for (int i = 0; i < steps; i++) {
+            zPrev = z; vPrev = v;
 
-                // Build LUT for predictions
-                updatePredictionLookupTable(A, B);
+            final double k1_v = accel(z, v, k_now, rho_now) * dt;
+            final double k1_z = v * dt;
 
-                // Publish trace (if sink set)
-                if (traceSink != null) {
-                    double unc = Math.max(uncertainties[0] / Math.abs(A), uncertainties[1] / Math.max(1e-6, B));
-                    Double apoStrictObj = getPredictionIfReady();
-                    double apoStrict = (apoStrictObj != null) ? apoStrictObj : Double.NaN;
-                    Double apoBestObj = getApogeeBestEffort();
-                    double apoBest = (apoBestObj != null) ? apoBestObj : Double.NaN;
-                    publishTrace(tFitNow, currentAltitude, currentVelocity, verticalAcceleration_includingG, apoStrict, apoBest, unc, len, "fit complete");
-                }
-            }
-            lastRunLength = len;
-        }
-    }
+            final double v2 = v + 0.5 * k1_v;
+            final double z2 = z + 0.5 * k1_z;
+            final double k2_v = accel(z2, v2, k_now, rho_now) * dt;
+            final double k2_z = v2 * dt;
 
-    public void reset() {
-        accelerations.clear();
-        dts.clear();
-        cumulativeTime = new double[0];
-        tFitNow = 0.0;
-        hasConverged = false;
-        lastRunLength = 0;
-        A = INIT_A; B = INIT_B;
-        uncertainties = new double[] { Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY };
-        lutVelocities = null;
-        lutDeltaHeights = null;
-    }
+            final double v3 = v + 0.5 * k2_v;
+            final double z3 = z + 0.5 * k2_z;
+            final double k3_v = accel(z3, v3, k_now, rho_now) * dt;
+            final double k3_z = v3 * dt;
 
-    public Double getPredictionIfReady() {
-        if (!hasConverged || uncertainties[0] > UNCERTAINTY_THRESHOLD * Math.abs(A) ||
-            uncertainties[1] > UNCERTAINTY_THRESHOLD * Math.max(1e-6, B)) {
-            return null;
-        }
-        return getApogeeBestEffort();
-    }
+            final double v4 = v + k3_v;
+            final double z4 = z + k3_z;
+            final double k4_v = accel(z4, v4, k_now, rho_now) * dt;
+            final double k4_z = v4 * dt;
 
-    public Double getApogeeBestEffort() {
-        if (lutVelocities == null || lutDeltaHeights == null || currentVelocity <= 0.0) return null;
-        final double deltaH = interp1(currentVelocity, lutVelocities, lutDeltaHeights);
-        return currentAltitude + deltaH;
-    }
+            v += (k1_v + 2.0*k2_v + 2.0*k3_v + k4_v) / 6.0;
+            z += (k1_z + 2.0*k2_z + 2.0*k3_z + k4_z) / 6.0;
 
-    // ------------- Fit logic -----------------------
-
-    private static final class CurveCoefficients {
-        final double A, B;
-        final double[] uncertainties;
-        CurveCoefficients(double A, double B, double[] unc) { this.A = A; this.B = B; this.uncertainties = unc; }
-    }
-
-    private CurveCoefficients fitCurve(double[] a, double[] t) {
-        final int n = a.length;
-        if (n < 2) return null;
-
-        // Gauss-Newton with LM damping
-        double A_est = INIT_A;
-        double B_est = INIT_B;
-
-        for (int iter = 0; iter < MAX_ITERS; iter++) {
-            double J11 = 0, J12 = 0, J21 = 0, J22 = 0;
-            double r1 = 0, r2 = 0;
-
-            for (int i = 0; i < n; i++) {
-                final double ti = t[i];
-                final double oneMinusBt = clamp(1.0 - B_est * ti, -5.0, 5.0);
-                final double oneMinusBt2 = oneMinusBt * oneMinusBt;
-                final double oneMinusBt3 = oneMinusBt2 * oneMinusBt;
-                final double oneMinusBt4 = oneMinusBt2 * oneMinusBt2;
-
-                final double f = A_est * oneMinusBt4;
-                final double r = a[i] - f;
-
-                final double dfdA = oneMinusBt4;
-                final double dfdB = -4.0 * A_est * ti * oneMinusBt3;
-
-                J11 += dfdA * dfdA;
-                J12 += dfdA * dfdB;
-                J21 += dfdB * dfdA;
-                J22 += dfdB * dfdB;
-
-                r1 += r * dfdA;
-                r2 += r * dfdB;
-            }
-
-            // LM damping
-            J11 += LM_LAMBDA * J11;
-            J22 += LM_LAMBDA * J22;
-
-            final double det = J11 * J22 - J12 * J21;
-            if (Math.abs(det) < 1e-18) break;
-
-            final double dA = (J22 * r1 - J12 * r2) / det;
-            final double dB = (J11 * r2 - J21 * r1) / det;
-
-            A_est += dA;
-            B_est += dB;
-
-            // Enforce constraints
-            if (A_est > 0.0) A_est = -Math.abs(A_est);  // A <= 0
-            B_est = Math.max(0.0, B_est);
-
-            if (Math.abs(dA) < 1e-6 && Math.abs(dB) < 1e-6) break;
+            if (v <= 0.0) { crossed = true; break; }
         }
 
-        // Approximate covariance from (J^T J)^{-1} scaled by residual variance
-        double H11 = 0, H12 = 0, H22 = 0;
-        double rss = 0;
-        
-        for (int i = 0; i < t.length; i++) {
-            final double ti = t[i];
-            final double oneMinusBt = clamp(1.0 - B_est * ti, -5.0, 5.0);
-            final double oneMinusBt2 = oneMinusBt * oneMinusBt;
-            final double oneMinusBt3 = oneMinusBt2 * oneMinusBt;
-            final double oneMinusBt4 = oneMinusBt2 * oneMinusBt2;
-
-            final double fi = A_est * oneMinusBt4;
-            final double ri = a[i] - fi;
-            rss += ri * ri;
-
-            final double dfdA = oneMinusBt4;
-            final double dfdB = -4.0 * A_est * ti * oneMinusBt3;
-            H11 += dfdA * dfdA;
-            H12 += dfdA * dfdB;
-            H22 += dfdB * dfdB;
-        }
-        final double det = H11 * H22 - H12 * H12;
-        final double s2  = (t.length > 2) ? rss / (t.length - 2) : rss;
-
-        double varA, varB;
-        if (Math.abs(det) >= 1e-18) {
-            varA = s2 * ( H22 / det);
-            varB = s2 * ( H11 / det);
+        if (crossed) {
+            // Linear interpolation to v=0 crossing.
+            final double frac = vPrev / (vPrev - Math.max(v, -1e-9));
+            final double zAp = zPrev + Math.max(0.0, Math.min(1.0, frac)) * (z - zPrev);
+            lastApogeeMSL = Double.isFinite(zAp) ? zAp : zPrev;
         } else {
-            varA = varB = Double.POSITIVE_INFINITY;
+            // If not crossed, conservative ballistic top-off.
+            lastApogeeMSL = z + Math.max(0.0, v*v) / (2.0 * G);
         }
-        final double sA = varA > 0 ? Math.sqrt(varA) : Double.POSITIVE_INFINITY;
-        final double sB = varB > 0 ? Math.sqrt(varB) : Double.POSITIVE_INFINITY;
-
-        return new CurveCoefficients(A_est, B_est, new double[] { sA, sB });
     }
 
-    // ------------- LUT build -----------------------
-
-    /**
-     * Build ΔH(v) table from current state by integrating the fitted model forward until apogee.
-     */
-    private void updatePredictionLookupTable(double A, double B) {
-        final int N = Math.max(2, (int) Math.ceil(FLIGHT_LENGTH_SECONDS / INTEGRATION_DT_SECONDS));
-        final double t0 = this.tFitNow;  // <-- time offset from last sample
-
-        double[] vel = new double[N];
-        double[] alt = new double[N];
-
-        // Integrate forward from the CURRENT state, using a(t0 + tau)
-        double v    = currentVelocity;
-        double h    = currentAltitude;
-        double hMax = h;
-        int    iAp  = 0;
-
-        for (int i = 0; i < N; i++) {
-            final double tau = i * INTEGRATION_DT_SECONDS;
-            double oneMinusBt = 1.0 - B * (t0 + tau);
-            // keep the gentle clamp if you had it; it does not bind near apogee for realistic t
-            if (oneMinusBt >  5.0) oneMinusBt =  5.0;
-            if (oneMinusBt < -5.0) oneMinusBt = -5.0;
-
-            final double oneMinusBt2 = oneMinusBt * oneMinusBt;
-            final double oneMinusBt4 = oneMinusBt2 * oneMinusBt2;
-
-            final double aModel = A * oneMinusBt4; // includes g
-            v += aModel * INTEGRATION_DT_SECONDS;
-            vel[i] = v;
-
-            h += v * INTEGRATION_DT_SECONDS;
-            alt[i] = h;
-
-            if (h > hMax) { hMax = h; iAp = i; }
-            if (i > 5 && vel[i] <= 0.0 && alt[i] < alt[i - 1] && iAp > 0) break;
-        }
-
-        // Use points up to and including apogee; add a terminal anchor at the current state
-        final int core = Math.max(2, iAp + 1);
-        final int M = core + 1;
-
-        double[] vAsc  = new double[M];
-        double[] dHAsc = new double[M];
-
-        // Fill reversed so v is ascending from ~0 to current v
-        for (int k = 0; k < core; k++) {
-            final int i = core - 1 - k;
-            vAsc[k]  = Math.max(0.0, vel[i]);
-            dHAsc[k] = hMax - alt[i];
-        }
-
-        // Terminal anchor = exactly the current state (ensures interpolation at v_current)
-        vAsc[M - 1]  = Math.max(0.0, currentVelocity);
-        dHAsc[M - 1] = Math.max(0.0, hMax - currentAltitude);
-
-        // Ensure strictly increasing x
-        for (int k = 1; k < M; k++) {
-            if (vAsc[k] <= vAsc[k - 1]) vAsc[k] = vAsc[k - 1] + 1e-9;
-        }
-
-        this.lutVelocities   = vAsc;
-        this.lutDeltaHeights = dHAsc;
+    /** dv/dt at (z, v) with density-scaled quadratic drag. */
+    private static double accel(double zMSL, double v, double k_now, double rho_now) {
+        if (!Double.isFinite(v)) return -G;
+        final double rho = AirDensity.rhoISA(zMSL);
+        final double k = (rho_now > 0.0) ? k_now * (rho / rho_now) : k_now;
+        return -G - k * v * Math.abs(v);
     }
 
+    /** Primary getter used by controller/listener. */
+    public Double getPredictionIfReady() { return lastApogeeMSL; }
 
-    // ------------- helpers -------------------------
+    /** Backward-compatible alias. */
+    public Double getApogeeBestEffort() { return lastApogeeMSL; }
 
-    private static double clamp(double x, double lo, double hi) {
-        if (x < lo) return lo;
-        if (x > hi) return hi;
-        return x;
+    /** Compatibility shim for the old 4-arg update signature. */
+    @Deprecated
+    public void update(double a_includingG, double dt, double altitudeAGL, double vZ) {
+        // No site altitude in old API → assume MSL ≈ AGL.
+        update(a_includingG, dt, altitudeAGL, altitudeAGL, vZ);
     }
 
-    private static double[] toArray(Deque<Double> dq) {
-        final double[] out = new double[dq.size()];
-        int i = 0;
-        for (double v : dq) out[i++] = v;
-        return out;
-    }
+    /** No-op for old tracing hook (left to preserve UI toggle). */
+    public void setTraceSink(TraceSink sink) { /* no-op */ }
 
-    /** Linear interpolation with boundary clamp. */
-    private static double interp1(double x, double[] xs, double[] ys) {
-        if (xs == null || ys == null || xs.length == 0) return 0.0;
-        if (x <= xs[0]) return ys[0];
-        final int n = xs.length;
-        if (x >= xs[n-1]) return ys[n-1];
-
-        int lo = 0, hi = n - 1;
-        while (hi - lo > 1) {
-            int mid = (lo + hi) >>> 1;
-            if (xs[mid] <= x) lo = mid; else hi = mid;
-        }
-        final double x0 = xs[lo], x1 = xs[hi];
-        final double y0 = ys[lo], y1 = ys[hi];
-        final double t = (x - x0) / Math.max(1e-12, (x1 - x0));
-        return y0 + t * (y1 - y0);
-    }
-
-    private static String fmt(double x) { return String.format("%.3f", x); }
+    // TraceSink kept for binary compatibility with prior code
+    public interface TraceSink { void trace(String line); }
 }
