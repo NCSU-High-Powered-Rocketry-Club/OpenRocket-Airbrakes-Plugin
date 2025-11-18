@@ -80,15 +80,6 @@ public class AirbrakeConfigurator
     panel.add(apogeeSpinner);
     panel.add(new UnitSelector(apogeeModel), "wrap");
 
-    // Deploy altitude threshold
-    panel.add(new JLabel("Deploy altitude threshold:"));
-    final DoubleModel threshModel = new DoubleModel(ext, "DeployAltitudeThreshold", UnitGroup.UNITS_DISTANCE, 0);
-    final JSpinner threshSpinner = new JSpinner(threshModel.getSpinnerModel());
-    
-    threshSpinner.setEditor(new SpinnerEditor(threshSpinner));
-    panel.add(threshSpinner);
-    panel.add(new UnitSelector(threshModel), "wrap");
-
     // Max Mach for deployment
     panel.add(new JLabel("Max Mach for deployment:"));
     final DoubleModel maxMachModel = new DoubleModel(ext, "MaxMachForDeployment", UnitGroup.UNITS_COEFFICIENT, 0);

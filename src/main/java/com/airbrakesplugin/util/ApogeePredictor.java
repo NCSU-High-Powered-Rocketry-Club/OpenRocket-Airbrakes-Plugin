@@ -24,16 +24,20 @@ public final class ApogeePredictor {
     private static final Logger LOG = LoggerFactory.getLogger(ApogeePredictor.class);
 
     // Constants
-    private static final double G = 9.80665;     // m/s^2
-    private static final double MIN_V = 0.01;    // m/s → consider "at apogee"
+    private static final double G      = 9.80665;  // m/s^2
+    private static final double MIN_V  = 0.01;     // m/s → consider "at apogee"
     private static final int    DEFAULT_STEPS = 30;
     private static final double MIN_DT = 1e-3;
-    private static final double MAX_DT = 0.1;    // sec per RK4 substep cap
+    private static final double MAX_DT = 0.1;      // sec per RK4 substep cap
 
     // Config
     private int rk4Steps = DEFAULT_STEPS;
 
-    // Last prediction
+    // Optional target apogee (AGL, meters) used to shape the look-ahead horizon.
+    // If null, the predictor simply integrates forward to the natural ballistic apogee.
+    private Double targetApogeeAGL = null;
+
+    // Last prediction (MSL)
     private Double lastApogeeMSL = null;
 
     public ApogeePredictor() { }
@@ -42,6 +46,12 @@ public final class ApogeePredictor {
     public void setRk4Steps(int steps) {
         if (steps >= 5 && steps <= 200) this.rk4Steps = steps;
     }
+
+    /** Set target apogee (AGL, meters) for horizon shaping; may be null. */
+    public void setTargetApogeeAGL(Double targetAGL) { this.targetApogeeAGL = targetAGL; }
+
+    /** Get the current target apogee (AGL, meters), or null if not set. */
+    public Double getTargetApogeeAGL() { return targetApogeeAGL; }
 
     /** Reset (clears last prediction). */
     public void reset() { lastApogeeMSL = null; }
@@ -79,10 +89,50 @@ public final class ApogeePredictor {
 
         final double rho_now = AirDensity.rhoISA(altitudeMSL);
 
-        // Use ~30 fixed substeps unless constrained by safety caps.
-        final double t_no_drag = vZ / G; // time to apogee ignoring drag
-        double dt = Math.max(MIN_DT, Math.min(MAX_DT, Math.abs(t_no_drag) / Math.max(1, rk4Steps)));
-        int steps = rk4Steps;
+        // --- Choose look-ahead horizon ---
+        // Base horizon: ballistic time-to-apogee ignoring drag.
+        final double t_no_drag = vZ / G;
+
+        // Optional: shrink horizon to the ballistic time to the *target* apogee (AGL),
+        // if the UI has provided one and it lies above the current altitude.
+        double t_to_target = Double.NaN;
+        if (targetApogeeAGL != null && Double.isFinite(targetApogeeAGL)) {
+            final double dzAGL = targetApogeeAGL - altitudeAGL;
+            if (dzAGL > 0.0) {
+                // Solve 0.5*g*t^2 - v*t + dz = 0 for t > 0 (ballistic, no drag).
+                final double a = 0.5 * G;
+                final double b = -vZ;
+                final double c = dzAGL;
+                final double disc = b*b - 4.0*a*c;
+                if (disc >= 0.0) {
+                    final double sqrt = Math.sqrt(disc);
+                    double t1 = (b + sqrt) / (2.0 * a);
+                    double t2 = (b - sqrt) / (2.0 * a);
+                    double best = Double.POSITIVE_INFINITY;
+                    if (t1 > 0.0 && t1 < best) best = t1;
+                    if (t2 > 0.0 && t2 < best) best = t2;
+                    if (Double.isFinite(best) && best > 0.0) t_to_target = best;
+                }
+            }
+        }
+
+        double t_horizon = Math.abs(t_no_drag);
+        if (Double.isFinite(t_to_target) && t_to_target > 0.0) {
+            t_horizon = Math.min(t_horizon, t_to_target);
+        }
+        if (!Double.isFinite(t_horizon) || t_horizon <= 0.0) {
+            t_horizon = Math.abs(t_no_drag);
+        }
+
+        // --- Use the simulation timestep as the RK4 substep, clamped for safety ---
+        double dt = Math.max(MIN_DT, Math.min(MAX_DT, Math.abs(dtSim)));
+        int maxSteps = Math.max(1, rk4Steps);
+        int steps = (int) Math.ceil(t_horizon / dt);
+        if (steps < 1) steps = 1;
+        if (steps > maxSteps) {
+            steps = maxSteps;
+            dt = t_horizon / steps;
+        }
 
         double z = altitudeMSL;
         double v = vZ;

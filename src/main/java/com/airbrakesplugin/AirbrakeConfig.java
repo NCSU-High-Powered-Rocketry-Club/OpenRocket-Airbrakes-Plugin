@@ -22,7 +22,6 @@ public class AirbrakeConfig {
 
     // Target & safety gates
     private double  targetApogee;
-    private double  deployAltitudeThreshold;
     private double  maxMachForDeployment;
 
     // Bang-bang controller options
@@ -55,7 +54,6 @@ public class AirbrakeConfig {
         this.referenceLength = 0.0;          // m
         this.maxDeploymentRate = 40.0;       // 1/s (fraction per second)
         this.targetApogee = 0.0;             // m AGL
-        this.deployAltitudeThreshold = 0.0;  // m AGL – prevent ground tests
         this.maxMachForDeployment = 1.0;     // cap for supersonic
         this.alwaysOpenMode = false;
         this.alwaysOpenPercentage = 1;       // 0–1
@@ -82,9 +80,6 @@ public class AirbrakeConfig {
 
     public double getTargetApogee()                  { return targetApogee; }
     public void   setTargetApogee(double apogee)     { this.targetApogee = apogee; }
-
-    public double getDeployAltitudeThreshold()       { return deployAltitudeThreshold; }
-    public void   setDeployAltitudeThreshold(double h){ this.deployAltitudeThreshold = h; }
 
     public double getMaxMachForDeployment()          { return maxMachForDeployment; }
     public void   setMaxMachForDeployment(double m)  { this.maxMachForDeployment = m; }
@@ -153,7 +148,6 @@ public class AirbrakeConfig {
                 ", referenceLength=" + referenceLength +
                 ", maxDeploymentRate=" + maxDeploymentRate +
                 ", targetApogee=" + targetApogee +
-                ", deployAltitudeThreshold=" + deployAltitudeThreshold +
                 ", maxMachForDeployment=" + maxMachForDeployment +
                 ", alwaysOpenMode=" + alwaysOpenMode +
                 ", alwaysOpenPercentage=" + alwaysOpenPercentage +
