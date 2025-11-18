@@ -26,6 +26,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
     private static final Logger log = LoggerFactory.getLogger(AirbrakeSimulationListener.class);
 
+    // small threshold to distinguish "no thrust" from "burning"
+    private static final double THRUST_EPS_N = 1e-3;
+
     // Collaborators
     private final AirbrakeAerodynamics airbrakes;
     private final AirbrakeController   controller;
@@ -39,7 +42,11 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     private double ext = 0.0;
     private double lastTime = Double.NaN;
     private Double lastVz = null;
-    private Double burnoutTimeS = null;       // set when thrust first <= 0
+
+    /** Time when thrust last fell to (or below) THRUST_EPS_N after having been positive. */
+    private Double burnoutTimeS = null;
+    /** Track whether we have ever seen positive thrust in this run. */
+    private boolean seenPositiveThrust = false;
 
     // Flight data columns
     private static final FlightDataType AIRBRAKE_EXT =
@@ -80,11 +87,11 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
     public void startSimulation(SimulationStatus status) throws SimulationException {
         // Initial state for each run
         setExt(0.0);
-        lastTime      = status.getSimulationTime();
-        lastVz        = null;
-        burnoutTimeS  = null;
+        lastTime           = status.getSimulationTime();
+        lastVz             = null;
+        burnoutTimeS       = null;
+        seenPositiveThrust = false;
 
-        // Wire controller context & reset
         if (controller != null) {
             controller.setContext(ctx);
             controller.reset();
@@ -93,7 +100,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             predictor.reset();
         }
 
-        // Seed flight data to non-NaN values
         final FlightDataBranch fdb = status.getFlightDataBranch();
         if (fdb != null) {
             fdb.setValue(AIRBRAKE_EXT, 0.0);
@@ -103,30 +109,37 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         log.info("Simulation started - initial time: {}, airbrakes retracted", lastTime);
     }
 
+    /** Update burnoutTimeS / seenPositiveThrust based on current thrust. */
+    private void updateBurnoutDetection(final SimulationStatus status) {
+        final FlightDataBranch fdb = status.getFlightDataBranch();
+        if (fdb == null) {
+            return;
+        }
+
+        final double thrustN = fdb.getLast(FlightDataType.TYPE_THRUST_FORCE);
+        final double t = status.getSimulationTime();
+
+        if (thrustN > THRUST_EPS_N) {
+            seenPositiveThrust = true;
+        }
+
+        if (seenPositiveThrust && burnoutTimeS == null && thrustN <= THRUST_EPS_N) {
+            burnoutTimeS = t;
+            log.debug("Captured burnout time: {} s", burnoutTimeS);
+        }
+    }
+
     // Gating policy: burnout + Mach  (no minimum deployment altitude)
     private boolean isExtensionAllowed(final SimulationStatus status) {
         final double t = status.getSimulationTime();
 
-        final FlightDataBranch fdb = status.getFlightDataBranch();
-        if (fdb == null) {
-            log.debug("No FlightDataBranch; extension not allowed");
-            return false;
-        }
+        updateBurnoutDetection(status);
 
-        // Capture burnout time once (thrust <= 0)
-        final double thrustN = fdb.getLast(FlightDataType.TYPE_THRUST_FORCE);
-        if (burnoutTimeS == null && thrustN <= 0.0) {
-            burnoutTimeS = t;
-            log.debug("Captured burnout time: {} s", burnoutTimeS);
-        }
-
-        // Must have observed burnout, and we must be at/after it
         if (burnoutTimeS == null || t < burnoutTimeS) {
             log.debug("Extension NOT allowed: waiting for burnout (t={}, burnoutTimeS={})", t, burnoutTimeS);
             return false;
         }
 
-        // Mach number gate (use MSL for speed of sound consistency)
         final Coordinate v = status.getRocketVelocity();
         final double speed = Math.sqrt(v.length2());
         final double altitudeMSL = status.getRocketPosition().z +
@@ -152,31 +165,24 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final Coordinate pos = status.getRocketPosition();
         final double vz = vel.z;
 
-        final double siteAlt      = status.getSimulationConditions().getLaunchSite().getAltitude();
-        final double altitudeAGL  = pos.z;
-        final double altitudeMSL  = altitudeAGL + siteAlt;
+        final double siteAlt     = status.getSimulationConditions().getLaunchSite().getAltitude();
+        final double altitudeAGL = pos.z;
+        final double altitudeMSL = altitudeAGL + siteAlt;
 
         log.debug("preStep t={} dt={}  pos={}  vel={}  vz={}  altAGL={}  altMSL={}",
-                t, dt, pos, vel, vz, altitudeAGL, altitudeMSL);
+                  t, dt, pos, vel, vz, altitudeAGL, altitudeMSL);
 
         final FlightDataBranch fdb = status.getFlightDataBranch();
 
-        // Capture burnout time here as well (so override mode has it even if we skip gates)
-        if (fdb != null) {
-            final double thrustN_pre = fdb.getLast(FlightDataType.TYPE_THRUST_FORCE);
-            if (burnoutTimeS == null && thrustN_pre <= 0.0) {
-                burnoutTimeS = t;
-                log.debug("Captured burnout time (preStep): {} s", burnoutTimeS);
-            }
-        }
+        // Keep burnout detection up to date for override / gating
+        updateBurnoutDetection(status);
 
         // Predictor update (world-Z acceleration including g) using finite-difference
         if (lastVz != null && predictor != null) {
             final double a_worldZ_incl_g = (vz - lastVz) / dt;
-            // Uses RK4 update: (a, dtSim, z_AGL, z_MSL, vZ)
             predictor.update(a_worldZ_incl_g, dt, altitudeAGL, altitudeMSL, vz);
             log.debug("Predictor updated: az={} lastVz={} zAGL={} zMSL={}",
-                    a_worldZ_incl_g, lastVz, altitudeAGL, altitudeMSL);
+                      a_worldZ_incl_g, lastVz, altitudeAGL, altitudeMSL);
         }
         lastVz = vz;
 
@@ -199,39 +205,37 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         Double apUsedAGL = null;
         if (apUsedMSL != null && Double.isFinite(apUsedMSL)) {
-            apUsedAGL = apUsedMSL - siteAlt;  // *** convert predicted apogee from MSL → AGL ***
+            apUsedAGL = apUsedMSL - siteAlt;
         }
 
-        // Publish predicted apogee (AGL; NaN if not ready)
         if (fdb != null) {
             fdb.setValue(PRED_APOGEE, apUsedAGL != null ? apUsedAGL : Double.NaN);
         }
 
         if (apUsedAGL != null) {
             log.debug("Apogee(pred_AGL)={} m vs altAGL={} m  (margin_AGL={} m)",
-                    apUsedAGL, altitudeAGL, apUsedAGL - altitudeAGL);
+                      apUsedAGL, altitudeAGL, apUsedAGL - altitudeAGL);
         } else {
             log.debug("Apogee(pred)=N/A (predictor not ready)");
         }
 
-        // --- Burnout-only override (kept minimal; returns early when active) ---
+        // Burnout-only override
         if (config != null && config.isDeployAfterBurnoutOnly()) {
             final double delay = Math.max(0.0, config.getDeployAfterBurnoutDelayS());
             double airbrake_ext_override;
             if (burnoutTimeS == null) {
-                // Still burning → keep retracted
                 airbrake_ext_override = 0.0;
                 log.debug("Override active: waiting for burnout");
             } else {
                 final double dtSinceBurnout = t - burnoutTimeS;
                 if (dtSinceBurnout >= delay) {
-                    airbrake_ext_override = 1.0; // force full deploy after burnout+delay
+                    airbrake_ext_override = 1.0;
                     log.debug("Override active: burnout+delay reached (dtSinceBurnout={} >= delay={}) → EXTEND",
-                            dtSinceBurnout, delay);
+                              dtSinceBurnout, delay);
                 } else {
-                    airbrake_ext_override = 0.0; // still within delay window
+                    airbrake_ext_override = 0.0;
                     log.debug("Override active: within delay (dtSinceBurnout={} < delay={}) → RETRACT",
-                            dtSinceBurnout, delay);
+                              dtSinceBurnout, delay);
                 }
             }
             airbrake_ext_override = (airbrake_ext_override >= 0.5) ? 1.0 : 0.0;
@@ -239,35 +243,31 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             if (fdb != null) {
                 fdb.setValue(AIRBRAKE_EXT, this.ext);
             }
-            return true; // skip normal controller path
+            return true;
         }
 
         // Control: if apogee(AGL) > target(AGL) → EXTEND; else RETRACT (subject to gates)
-        double airbrake_ext; // authoritative for this step (will be forced to 0.0/1.0)
-
+        double airbrake_ext;
         if (isExtensionAllowed(status)) {
             final double targetAGL = (config != null) ? config.getTargetApogee() : Double.POSITIVE_INFINITY;
 
             if (apUsedAGL == null || !Double.isFinite(apUsedAGL)) {
-                // Predictor not ready → retract (safe default)
                 airbrake_ext = 0.0;
                 log.debug("Predictor not ready; retracting by default");
             } else {
                 airbrake_ext = (apUsedAGL > targetAGL) ? 1.0 : 0.0;
                 log.debug("Control decision: apUsedAGL={} targetAGL={} => airbrake_ext={}",
-                        apUsedAGL, targetAGL, airbrake_ext);
+                          apUsedAGL, targetAGL, airbrake_ext);
             }
         } else {
-            // Outside gates: force retract
             airbrake_ext = 0.0;
             log.debug("Outside gates; forcing retract");
         }
 
-        // Enforce hard 0.0 / 1.0, assign to class state, and persist
         airbrake_ext = (airbrake_ext >= 0.5) ? 1.0 : 0.0;
         setExt(airbrake_ext);
         if (fdb != null) {
-            fdb.setValue(AIRBRAKE_EXT, this.ext);    // also visible in flight data plots
+            fdb.setValue(AIRBRAKE_EXT, this.ext);
         }
 
         return true;
@@ -278,20 +278,17 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
                                                  FlightConditions fc) throws SimulationException {
         this.flightConditions = fc;
         log.debug("Flight conditions updated - AOA={}, refArea(rocket)={}, refArea(cfg)={}, Mach={}",
-                fc.getAOA(), fc.getRefArea(),
-                (config != null ? config.getReferenceArea() : Double.NaN),
-                fc.getMach());
+                  fc.getAOA(), fc.getRefArea(),
+                  (config != null ? config.getReferenceArea() : Double.NaN),
+                  fc.getMach());
         return fc;
     }
 
-    /**
-     * Overrides the coefficient of drag after the aerodynamic calculations are done each timestep.
-     * We compute combined CD from the rocket and airbrakes so OR's solver consumes it.
-     */
     @Override
     public AerodynamicForces postAerodynamicCalculation(final SimulationStatus status,
                                                         final AerodynamicForces forces) throws SimulationException {
-        // --- Keep original gating, but allow aero when override is "active now" ---
+        updateBurnoutDetection(status);
+
         boolean overrideActiveNow = false;
         if (config != null && config.isDeployAfterBurnoutOnly() && burnoutTimeS != null) {
             final double delay = Math.max(0.0, config.getDeployAfterBurnoutDelayS());
@@ -303,7 +300,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             return forces;
         }
 
-        // Latest kinematics
         final Coordinate vVec = status.getRocketVelocity();
         final double v2 = vVec.length2();
         final double speed = Math.sqrt(v2);
@@ -316,7 +312,6 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
 
         final double mach = flightConditions.getMach();
 
-        // Latest environment and reference areas
         final double altitudeMSL = status.getRocketPosition().z +
                 status.getSimulationConditions().getLaunchSite().getAltitude();
 
@@ -329,16 +324,13 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             airbrakes_area = airbrakesAreaFallback;
         }
 
-        // Get latest extension from FDB
         final FlightDataBranch fdb = status.getFlightDataBranch();
         double airbrakeExt = (fdb != null ? fdb.getLast(AIRBRAKE_EXT) : this.ext);
         if (!Double.isFinite(airbrakeExt)) airbrakeExt = this.ext;
-        airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0; // enforce 0/1
+        airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0;
 
-        // Compute drag from your ΔDrag surface
         final double dragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
 
-        // Existing rocket drag (from OR) in axial and total form
         final double cd_roc_axial = forces.getCDaxial();
         final double dragForceN_roc_axial = cd_roc_axial * dynP * rocket_area;
 
@@ -346,14 +338,13 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double dragForceN_roc = cd_roc * dynP * rocket_area;
 
         log.debug("Airbrakes Drag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={})",
-                dragForceN_airbrakes, airbrakeExt, dragForceN_roc_axial, speed, vz, altitudeMSL);
+                  dragForceN_airbrakes, airbrakeExt, dragForceN_roc_axial, speed, vz, altitudeMSL);
 
         if (dynP <= 0 || rocket_area <= 0) {
             log.debug("dynP={} or rocket_area={} non-positive; skipping aero override", dynP, rocket_area);
             return forces;
         }
 
-        // Combine rocket + airbrake drag, then back out effective CDs on combined reference area
         final double combinedArea = rocket_area + Math.max(0.0, airbrakes_area);
 
         double drag_total_axial = dragForceN_roc_axial + dragForceN_airbrakes;
@@ -365,15 +356,14 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         forces.setCDaxial(Cd_total_axial);
         forces.setCD(Cd_total);
 
-        // Optional diagnostic: predicted apogee (AGL) this step
         if (fdb != null) {
             final double apAGL = fdb.getLast(PRED_APOGEE);
             if (Double.isFinite(apAGL)) {
                 log.debug("PostAero: set CDaxial={} (was {}), set CD={} (was {}), Apogee(pred_AGL)={} m",
-                        Cd_total_axial, cd_roc_axial, Cd_total, cd_roc, apAGL);
+                          Cd_total_axial, cd_roc_axial, Cd_total, cd_roc, apAGL);
             } else {
                 log.debug("PostAero: set CDaxial={} (was {}), set CD={} (was {}), Apogee(pred)=N/A",
-                        Cd_total_axial, cd_roc_axial, Cd_total, cd_roc);
+                          Cd_total_axial, cd_roc_axial, Cd_total, cd_roc);
             }
         }
 
