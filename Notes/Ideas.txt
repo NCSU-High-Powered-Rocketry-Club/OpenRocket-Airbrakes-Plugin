@@ -1,7 +1,0 @@
-Current code controller is a basic ballistic prediction --> that needs to get fixed
-(Stupid GPT)
-
-If we are already going to be doing a different controller what is the point of doing anything right now --> More work to translate
-
-On the other hand I need to get stuff done and working to our current code base
-
