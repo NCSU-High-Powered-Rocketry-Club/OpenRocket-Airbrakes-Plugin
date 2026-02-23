@@ -102,35 +102,43 @@ public class AirbrakeConfigurator
         JPanel burn = new JPanel(new MigLayout("insets 8, fillx", "[right]10[grow,fill][right]10[120!]"));
         burn.setBorder(new TitledBorder("Burnout-only deployment"));
 
-        JCheckBox cbBurnOnly = new JCheckBox("Deploy airbrakes only after motor burnout");
+        final JCheckBox cbBurnOnly = new JCheckBox("Deploy airbrakes only after motor burnout");
         cbBurnOnly.setToolTipText("When checked, ignores apogee prediction and deploys fully a set time after burnout.");
         cbBurnOnly.setSelected(ext.isDeployAfterBurnoutOnly());
 
-        SpinnerNumberModel delayModel = new SpinnerNumberModel(
+        final SpinnerNumberModel delayModel = new SpinnerNumberModel(
             Math.max(0.0, ext.getDeployAfterBurnoutDelayS()), // value
             0.0,                                             // min
             60.0,                                            // max
             0.1                                              // step
         );
-        JSpinner spDelay = new JSpinner(delayModel);
+        final JSpinner spDelay = new JSpinner(delayModel);
         ((JSpinner.DefaultEditor) spDelay.getEditor()).getTextField().setColumns(6);
-        spDelay.setEnabled(ext.isDeployAfterBurnoutOnly());
+        final JLabel delayLabel = new JLabel("Delay after burnout:");
+        final JLabel secLabel = new JLabel("s");
 
-        cbBurnOnly.addItemListener(e -> {
-        boolean on = (e.getStateChange() == ItemEvent.SELECTED);
-        ext.setDeployAfterBurnoutOnly(on);
-        spDelay.setEnabled(on);
+        Runnable syncBurnoutControls = () -> {
+            boolean enabled = cbBurnOnly.isSelected();
+            spDelay.setEnabled(enabled);
+            delayLabel.setEnabled(enabled);
+            secLabel.setEnabled(enabled);
+        };
+        syncBurnoutControls.run();
+
+        cbBurnOnly.addActionListener(e -> {
+            ext.setDeployAfterBurnoutOnly(cbBurnOnly.isSelected());
+            syncBurnoutControls.run();
         });
 
         spDelay.addChangeListener(e -> {
-        double v = ((Number) spDelay.getValue()).doubleValue();
-        ext.setDeployAfterBurnoutDelayS(Math.max(0.0, v));
+            double v = ((Number) spDelay.getValue()).doubleValue();
+            ext.setDeployAfterBurnoutDelayS(Math.max(0.0, v));
         });
 
         burn.add(cbBurnOnly, "span 3, wrap");
-        burn.add(new JLabel("Delay after burnout:"));
+        burn.add(delayLabel);
         burn.add(spDelay, "growx");
-        burn.add(new JLabel("s"), "wrap");
+        burn.add(secLabel, "wrap");
 
         panel.add(burn, "span 3, growx, wrap");
     }

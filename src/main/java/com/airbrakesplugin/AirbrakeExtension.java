@@ -205,16 +205,32 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
         return fallback;
     }
 
+    /**
+     * Read a boolean from the persisted config.
+     * <p>
+     * Booleans are stored as doubles (1.0 = true, 0.0 = false) so they
+     * go through the exact same serialization path as every other numeric
+     * value — which is proven to round-trip through .ork save/load.
+     * <p>
+     * For backward compatibility we also recognise raw String values
+     * "true" / "false" that may have been written by earlier builds.
+     */
     private boolean cfgBool(String key, String legacyKey, boolean fallback) {
+        // 1. Check the raw value first for backward-compat with old string storage
         Object v = invokeConfigGetRaw(key);
         if (v == null && legacyKey != null) v = invokeConfigGetRaw(legacyKey);
+
         if (v instanceof Boolean b) return b;
-        if (v instanceof Number n) return n.doubleValue() != 0.0;
         if (v instanceof String s) {
-            if ("true".equalsIgnoreCase(s) || "false".equalsIgnoreCase(s)) return Boolean.parseBoolean(s);
-            try { return Double.parseDouble(s.trim()) != 0.0; } catch (Exception ignored) { }
+            String sl = s.trim().toLowerCase();
+            if ("true".equals(sl))  return true;
+            if ("false".equals(sl)) return false;
         }
-        return fallback;
+
+        // 2. Use the proven cfgDouble path (booleans are now stored as 1.0/0.0)
+        double numericFallback = fallback ? 1.0 : 0.0;
+        double d = cfgDouble(key, legacyKey, numericFallback);
+        return d != 0.0;
     }
 
     private void cfgPutDouble(String key, double value) {
@@ -228,10 +244,13 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
         try { config.put(key, value); } catch (Throwable ignored) { }
     }
 
+    /**
+     * Persist a boolean into the config as a double (1.0 / 0.0).
+     * This reuses the proven cfgPutDouble path so it serializes
+     * identically to every other numeric setting in the .ork file.
+     */
     private void cfgPutBool(String key, boolean value) {
-        if (invokeConfigPut(key, value)) return;
-        // As a last resort, store as string for max compatibility
-        cfgPutString(key, value ? "true" : "false");
+        cfgPutDouble(key, value ? 1.0 : 0.0);
     }
 
     // ---------------------------------------------------------------------
