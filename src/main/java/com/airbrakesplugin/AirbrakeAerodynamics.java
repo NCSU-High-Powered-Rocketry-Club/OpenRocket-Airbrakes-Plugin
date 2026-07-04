@@ -3,6 +3,7 @@ package com.airbrakesplugin;
 import com.airbrakesplugin.util.AirDensity;
 import com.airbrakesplugin.util.ExtrapolationType;
 import com.airbrakesplugin.util.GenericFunction2D;
+import com.airbrakesplugin.util.HighMachExtrapolationMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,6 +31,12 @@ public final class AirbrakeAerodynamics {
 
     /** Drag surface in Newtons (absolute airbrake drag). */
     private GenericFunction2D dragSurface;
+    private HighMachExtrapolationMode highMachExtrapolationMode = HighMachExtrapolationMode.BOUNDED_NONLINEAR;
+    private boolean allowNegativeDeltaDrag = false;
+    private double maxMachForAerodynamicModel = 5.0;
+    private double maxExtrapolatedForceMultiplier = 2.0;
+    private GenericFunction2D.Evaluation lastEvaluation =
+            GenericFunction2D.Evaluation.failClosed(0.0, "surface not evaluated");
 
     /** Path kept only for diagnostics/reload if desired. */
     private Path sourceCsv;
@@ -43,6 +50,19 @@ public final class AirbrakeAerodynamics {
         if (csvFilePath.isBlank()) {
             throw new IllegalArgumentException("CSV file path is empty");
         }
+        loadDragSurface(Path.of(csvFilePath), ExtrapolationType.CONSTANT);
+    }
+
+    public AirbrakeAerodynamics(AirbrakeConfig config) {
+        Objects.requireNonNull(config, "AirbrakeConfig must not be null");
+        String csvFilePath = config.getCfdDataFilePath();
+        if (csvFilePath == null || csvFilePath.isBlank()) {
+            throw new IllegalArgumentException("CSV file path is empty");
+        }
+        this.highMachExtrapolationMode = config.getHighMachExtrapolationMode();
+        this.allowNegativeDeltaDrag = config.isAllowNegativeDeltaDrag();
+        this.maxMachForAerodynamicModel = config.getMaxMachForAerodynamicModel();
+        this.maxExtrapolatedForceMultiplier = config.getMaxExtrapolatedForceMultiplier();
         loadDragSurface(Path.of(csvFilePath), ExtrapolationType.CONSTANT);
     }
 
@@ -60,9 +80,15 @@ public final class AirbrakeAerodynamics {
         Objects.requireNonNull(csvPath, "CSV path must not be null");
         Objects.requireNonNull(extrapolation, "Extrapolation must not be null");
         try {
-            this.dragSurface = GenericFunction2D.fromCsv(csvPath, extrapolation);
+            this.dragSurface = GenericFunction2D.fromCsv(csvPath, extrapolation, allowNegativeDeltaDrag);
             this.sourceCsv = csvPath;
-            LOG.info("Loaded airbrake Drag surface: {} (extrapolation: {})", csvPath, extrapolation);
+            double maxMach = this.dragSurface.xAxis()[this.dragSurface.xAxis().length - 1];
+            if (maxMach < maxMachForAerodynamicModel) {
+                LOG.warn("Airbrake Drag surface max Mach {} is below configured aerodynamic model max Mach {}: {}",
+                        maxMach, maxMachForAerodynamicModel, csvPath);
+            }
+            LOG.info("Loaded airbrake Drag surface: {} (legacy extrapolation: {}, highMachMode: {}, allowNegativeDeltaDrag: {})",
+                    csvPath, extrapolation, highMachExtrapolationMode, allowNegativeDeltaDrag);
         } catch (Exception e) {
             LOG.error("Failed to load Drag surface from {}: {}", csvPath, e.toString());
             throw (e instanceof IllegalArgumentException) ? (IllegalArgumentException) e : new IllegalArgumentException("Cannot load Drag surface: " + csvPath, e);
@@ -81,17 +107,29 @@ public final class AirbrakeAerodynamics {
      * @return Drag in Newtons (>= 0 typically), or 0.0 if the surface is not loaded.
      */
     public double getAirbrakeDragN(double mach, double deployFrac) {
+        return Math.max(0.0, getAirbrakeDeltaDragN(mach, deployFrac));
+    }
+
+    /**
+     * Interpolate or extrapolate signed airbrake delta drag [N].
+     * Positive values add drag; negative values reduce baseline drag and require
+     * allowNegativeDeltaDrag=true at CSV load time.
+     */
+    public double getAirbrakeDeltaDragN(double mach, double deployFrac) {
         if (dragSurface == null) {
             LOG.warn("Drag surface not loaded; returning 0 N");
+            lastEvaluation = GenericFunction2D.Evaluation.failClosed(0.0, "surface not loaded");
             return 0.0;
         }
         if (!Double.isFinite(mach)) {
-            LOG.trace("Non-finite Mach={} → using 0.0", mach);
-            mach = 0.0;
+            LOG.warn("Non-finite Mach={}; failing closed", mach);
+            lastEvaluation = GenericFunction2D.Evaluation.failClosed(0.0, "non-finite Mach");
+            return 0.0;
         }
         if (!Double.isFinite(deployFrac)) {
-            LOG.trace("Non-finite deploy={} → using 0.0", deployFrac);
-            deployFrac = 0.0;
+            LOG.warn("Non-finite deploy={}; failing closed", deployFrac);
+            lastEvaluation = GenericFunction2D.Evaluation.failClosed(0.0, "non-finite deployment");
+            return 0.0;
         }
         
         // Clamp deployment to [0..1] and nudge slightly to avoid exact boundaries if needed.
@@ -99,12 +137,31 @@ public final class AirbrakeAerodynamics {
         dep = nudge(dep, 0.0, 1.0);
 
         try {
-            double valN = dragSurface.dragN(mach, dep);
-            if (Double.isFinite(valN)) return Math.max(0.0, valN);
+            GenericFunction2D.Evaluation eval = dragSurface.evaluate(
+                    mach,
+                    dep,
+                    highMachExtrapolationMode,
+                    maxMachForAerodynamicModel,
+                    maxExtrapolatedForceMultiplier);
+            lastEvaluation = eval;
+            double valN = eval.valueN();
+            if (eval.failedClosed()) {
+                LOG.warn("Airbrake delta drag failed closed at Mach={}, Deploy={} from {}: {}",
+                        mach, dep, sourceCsv, eval.reason());
+                return 0.0;
+            }
+            if (Double.isFinite(valN) && valN < 0.0 && !allowNegativeDeltaDrag) {
+                LOG.warn("Airbrake delta drag failed closed at Mach={}, Deploy={} from {}: negative {} N produced while allowNegativeDeltaDrag=false",
+                        mach, dep, sourceCsv, valN);
+                lastEvaluation = GenericFunction2D.Evaluation.failClosed(0.0, "negative delta drag rejected");
+                return 0.0;
+            }
+            if (Double.isFinite(valN)) return valN;
         } catch (Exception ex) {
             LOG.debug("Drag interpolation failed at Mach={}, Deploy={} from {}: {}",
                     mach, dep, sourceCsv, ex.toString());
         }
+        lastEvaluation = GenericFunction2D.Evaluation.failClosed(0.0, "evaluation exception");
         return 0.0;
     }
 
@@ -124,10 +181,15 @@ public final class AirbrakeAerodynamics {
 
         final double mach = AirDensity.machFromV(speed, altitudeMSL);
         final double dep = clamp01(deploymentFrac);
-        final double FN = getAirbrakeDragN(mach, dep);
+        final double FN = getAirbrakeDeltaDragN(mach, dep);
 
-        LOG.trace("calculateDragForce: M={} dep={} → Drag={} N (speed={} m/s, altMSL={} m)", mach, dep, FN, speed, altitudeMSL);
+        LOG.trace("calculateDragForce: M={} dep={} → DeltaDrag={} N (mode={}, speed={} m/s, altMSL={} m)",
+                mach, dep, FN, lastEvaluation.mode(), speed, altitudeMSL);
         return FN;
+    }
+
+    public GenericFunction2D.Evaluation getLastEvaluation() {
+        return lastEvaluation;
     }
 
     /** @return true if the Drag surface is loaded. */
@@ -150,4 +212,3 @@ public final class AirbrakeAerodynamics {
         return v;
     }
 }
-

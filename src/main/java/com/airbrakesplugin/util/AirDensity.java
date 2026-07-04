@@ -9,9 +9,6 @@ public final class AirDensity {
     private static final double g  = 9.80665;    // m/s^2
     private static final double GAMMA = 1.4;     // air, up to ~25 km
 
-    // Compressibility handling
-    private static final double MACH_COMP_THRESHOLD = 0.30;
-
     private AirDensity() {} // utility class
 
     /** ISA temperature (K) – simple two-layer (0–11 km, 11–20 km isothermal). */
@@ -67,42 +64,19 @@ public final class AirDensity {
         return 0.5 * rho * v * v;
     }
 
-    /**
-     * Compressibility-aware dynamic pressure using velocity (Pa).
-     * For M ≤ 0.3 uses q_inc = ½ ρ V².
-     * For M > 0.3 uses isentropic impact pressure: qc = Pt − p.
-     */
+    /** Local aerodynamic dynamic pressure q = 1/2 rho V^2 (Pa). */
     public static double dynamicPressure(double h, double v) {
-        final double M = machFromV(v, h);
-        return dynamicPressureFromMach(h, M, v);
+        return dynamicPressureIncompressible(h, v);
     }
 
-    /**
-     * Compressibility-aware dynamic pressure when Mach is already known (Pa).
-     * If M ≤ 0.3 returns ½ ρ V² (requires V).
-     * If M > 0.3 returns qc = Pt − p (velocity not needed in that branch).
-     */
+    /** Local aerodynamic dynamic pressure q = 1/2 rho V^2 (Pa). */
     public static double dynamicPressureFromMach(double h, double mach, double vIfNeeded) {
-        if (!Double.isFinite(mach) || mach <= MACH_COMP_THRESHOLD) {
-            return dynamicPressureIncompressible(h, vIfNeeded);
-        }
-        final double p = pressureISA(h);
-        return CompressibleFlow.compressibleDynamicPressure(p, mach);
+        return dynamicPressureIncompressible(h, vIfNeeded);
     }
 
-    /**
-     * Effective density ρ_eff for use in q = ½ ρ_eff V².
-     * For M ≤ 0.3, ρ_eff = ρ.
-     * For M > 0.3, ρ_eff = ρ * (qc / q_inc), where
-     *    q_inc = ½ ρ V² and qc = Pt − p from isentropic relations.
-     */
+    /** Local density for use in q = 1/2 rho V^2. */
     public static double rhoForDynamicPressure(double h, double mach) {
-        final double rho = rhoISA(h);
-        if (!Double.isFinite(mach) || mach <= MACH_COMP_THRESHOLD) {
-            return rho;
-        }
-        final double corr = CompressibleFlow.dynamicPressureCorrection(mach); // qc / q_inc
-        return rho * corr;
+        return rhoISA(h);
     }
 
     /** Convenience overload when you have velocity instead of Mach. */

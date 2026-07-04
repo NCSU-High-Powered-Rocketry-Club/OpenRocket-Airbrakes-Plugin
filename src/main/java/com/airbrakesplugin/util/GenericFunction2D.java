@@ -35,6 +35,11 @@ public final class GenericFunction2D {
 
     /** Load Airbrake Drag surface from CSV (comma/semicolon/tab; quotes supported). */
     public static GenericFunction2D fromCsv(Path csvPath, ExtrapolationType xtrap) throws IOException {
+        return fromCsv(csvPath, xtrap, false);
+    }
+
+    /** Load Airbrake Drag surface from CSV with signed-delta validation. */
+    public static GenericFunction2D fromCsv(Path csvPath, ExtrapolationType xtrap, boolean allowNegativeDeltaDrag) throws IOException {
         try (BufferedReader br = Files.newBufferedReader(csvPath, StandardCharsets.UTF_8)) {
             String headerLine = readNonEmptyLine(br);
             if (headerLine == null) throw new IllegalArgumentException("CSV is empty: " + csvPath);
@@ -64,7 +69,13 @@ public final class GenericFunction2D {
                 double M = parseNumber(sM, "Mach");
                 double dep = parseNumber(sD, "Deployment");
                 double F  = parseNumber(sF, headers[iDrag]); // absolute drag [N]
-                if (!Double.isFinite(M) || !Double.isFinite(dep) || !Double.isFinite(F)) continue;
+                if (!Double.isFinite(M) || !Double.isFinite(dep) || !Double.isFinite(F)) {
+                    throw new IllegalArgumentException("CSV contains non-finite Mach/deployment/force row: " + line);
+                }
+                if (F < 0.0 && !allowNegativeDeltaDrag) {
+                    throw new IllegalArgumentException("CSV contains negative delta-drag " + F
+                            + " N but allowNegativeDeltaDrag=false");
+                }
 
                 raw.add(new Row(M, dep, F));
             }
@@ -72,6 +83,7 @@ public final class GenericFunction2D {
             if (raw.isEmpty()) throw new IllegalArgumentException("CSV has headers but no valid numeric rows: " + csvPath);
 
             normalizeDeploymentInPlace(raw);        // 0–100 → 0–1 if needed
+            validateDuplicateRows(raw);
             double[] xs = uniqueSorted(raw.stream().mapToDouble(r -> r.mach).toArray());
             double[] ys = uniqueSorted(raw.stream().mapToDouble(r -> r.depl).toArray());
             if (xs.length < 2 || ys.length < 2)
@@ -86,6 +98,45 @@ public final class GenericFunction2D {
             }
             return new GenericFunction2D(xs, ys, z, xtrap);
         }
+    }
+
+    public Evaluation evaluate(double mach,
+                               double deploy,
+                               HighMachExtrapolationMode mode,
+                               double maxMachForAerodynamicModel,
+                               double maxExtrapolatedForceMultiplier) {
+        if (!Double.isFinite(mach) || !Double.isFinite(deploy)) {
+            return Evaluation.failClosed(0.0, "non-finite input");
+        }
+        if (mach < 0.0) {
+            return Evaluation.failClosed(0.0, "negative Mach");
+        }
+        if (Double.isFinite(maxMachForAerodynamicModel) && mach > maxMachForAerodynamicModel) {
+            return Evaluation.failClosed(0.0, "Mach exceeds configured aerodynamic model limit");
+        }
+
+        final HighMachExtrapolationMode actualMode =
+                mode == null ? HighMachExtrapolationMode.BOUNDED_NONLINEAR : mode;
+        final double y = clamp(deploy, ys[0], ys[ys.length - 1]);
+        final boolean yClamped = y != deploy;
+        final boolean xInside = mach >= xs[0] && mach <= xs[xs.length - 1];
+
+        if (xInside) {
+            double val = interpolate(mach, y);
+            return new Evaluation(val, yClamped ? EvaluationMode.CLAMPED : EvaluationMode.INTERPOLATED,
+                    yClamped ? "deployment clamped" : "inside table bounds");
+        }
+
+        if (actualMode == HighMachExtrapolationMode.FAIL_CLOSED) {
+            return Evaluation.failClosed(0.0, "outside table bounds");
+        }
+        if (actualMode == HighMachExtrapolationMode.CONSTANT) {
+            double x = clamp(mach, xs[0], xs[xs.length - 1]);
+            double val = interpolate(x, y);
+            return new Evaluation(val, EvaluationMode.CLAMPED, "Mach clamped to table edge");
+        }
+
+        return boundedNonlinearExtrapolate(mach, y, maxExtrapolatedForceMultiplier);
     }
 
     /** Returns Airbrake Drag [N] at (mach, deploy). */
@@ -105,6 +156,11 @@ public final class GenericFunction2D {
             default: break;
         }
 
+        return interpolate(x, y);
+    }
+
+    private double interpolate(double x, double y) {
+        int nx = xs.length, ny = ys.length;
         int i = bracket(xs, x), j = bracket(ys, y);
         if (i == nx - 1) i = nx - 2;
         if (j == ny - 1) j = ny - 2;
@@ -119,6 +175,46 @@ public final class GenericFunction2D {
         double z0 = lerp(z00, z10, tx);
         double z1 = lerp(z01, z11, tx);
         return lerp(z0, z1, ty);
+    }
+
+    private Evaluation boundedNonlinearExtrapolate(double mach, double deploy, double maxMultiplier) {
+        final boolean lowSide = mach < xs[0];
+        final int edgeIdx = lowSide ? 0 : xs.length - 1;
+        final int innerIdx = lowSide ? 1 : xs.length - 2;
+        final double edgeMach = xs[edgeIdx];
+        final double innerMach = xs[innerIdx];
+        final double edgeVal = valueAtMachIndex(edgeIdx, deploy);
+        final double innerVal = valueAtMachIndex(innerIdx, deploy);
+        final double dx = Math.abs(edgeMach - innerMach);
+        if (dx <= 0.0) {
+            return Evaluation.failClosed(0.0, "invalid extrapolation edge spacing");
+        }
+
+        final double distance = Math.abs(mach - edgeMach);
+        final double trend = edgeVal - innerVal;
+        final double projected = edgeVal + trend * (1.0 - Math.exp(-distance / dx));
+        final double capBase = Math.max(Math.abs(edgeVal), 1e-9);
+        final double mult = (Double.isFinite(maxMultiplier) && maxMultiplier >= 1.0) ? maxMultiplier : 2.0;
+        final double cap = capBase * mult;
+        final double bounded = clamp(projected, -cap, cap);
+
+        if (!Double.isFinite(bounded)) {
+            return Evaluation.failClosed(0.0, "non-finite extrapolated force");
+        }
+        if (Math.abs(projected) > cap) {
+            return new Evaluation(bounded, EvaluationMode.EXTRAPOLATED,
+                    "bounded nonlinear extrapolation capped");
+        }
+        return new Evaluation(bounded, EvaluationMode.EXTRAPOLATED,
+                "bounded nonlinear extrapolation");
+    }
+
+    private double valueAtMachIndex(int machIndex, double deploy) {
+        int j = bracket(ys, deploy);
+        if (j == ys.length - 1) j = ys.length - 2;
+        double y0 = ys[j], y1 = ys[j+1];
+        double ty = (y1 == y0) ? 0.0 : (deploy - y0)/(y1 - y0);
+        return lerp(z[j][machIndex], z[j+1][machIndex], ty);
     }
 
     // Optional accessors
@@ -199,6 +295,17 @@ public final class GenericFunction2D {
     private static double lerp(double a,double b,double t){ return a + (b-a)*t; }
 
     private static Double findExact(List<Row> rows,double xm,double yd){ for(Row r:rows) if(r.mach==xm && r.depl==yd) return r.valN; return null; }
+    private static void validateDuplicateRows(List<Row> rows) {
+        Map<String, Double> seen = new HashMap<>();
+        for (Row r : rows) {
+            String key = Double.doubleToLongBits(r.mach) + ":" + Double.doubleToLongBits(r.depl);
+            Double prior = seen.putIfAbsent(key, r.valN);
+            if (prior != null && Math.abs(prior - r.valN) > 1e-9) {
+                throw new IllegalArgumentException("Conflicting duplicate CSV row for Mach="
+                        + r.mach + " Deployment=" + r.depl + ": " + prior + " vs " + r.valN);
+            }
+        }
+    }
     private static double idw(List<Row> rows,double xm,double yd,int K,double p,double eps){
         ArrayList<Node> ns=new ArrayList<>(rows.size());
         for(Row r:rows){ 
@@ -232,4 +339,32 @@ public final class GenericFunction2D {
 
     private static final class Row { final double mach; double depl; final double valN; Row(double m,double d,double v){mach=m;depl=d;valN=v;} }
     private static final class Node { final double d,v; Node(double d,double v){this.d=d;this.v=v;} }
+
+    public enum EvaluationMode {
+        INTERPOLATED,
+        CLAMPED,
+        EXTRAPOLATED,
+        FAIL_CLOSED
+    }
+
+    public static final class Evaluation {
+        private final double valueN;
+        private final EvaluationMode mode;
+        private final String reason;
+
+        public Evaluation(double valueN, EvaluationMode mode, String reason) {
+            this.valueN = valueN;
+            this.mode = mode == null ? EvaluationMode.FAIL_CLOSED : mode;
+            this.reason = reason == null ? "" : reason;
+        }
+
+        public static Evaluation failClosed(double valueN, String reason) {
+            return new Evaluation(valueN, EvaluationMode.FAIL_CLOSED, reason);
+        }
+
+        public double valueN() { return valueN; }
+        public EvaluationMode mode() { return mode; }
+        public String reason() { return reason; }
+        public boolean failedClosed() { return mode == EvaluationMode.FAIL_CLOSED; }
+    }
 }

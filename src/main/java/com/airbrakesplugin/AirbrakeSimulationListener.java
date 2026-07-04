@@ -53,6 +53,24 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             FlightDataType.getType("airbrakeExt", "airbrakeExt", UnitGroup.UNITS_RELATIVE);
     private static final FlightDataType PRED_APOGEE =
             FlightDataType.getType("predictedApogee", "predictedApogee", UnitGroup.UNITS_DISTANCE);
+    private static final FlightDataType AIRBRAKE_MACH =
+            FlightDataType.getType("airbrakeMach", "airbrakeMach", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_DELTA_FORCE =
+            FlightDataType.getType("airbrakeDeltaForceN", "airbrakeDeltaForceN", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_EVAL_MODE =
+            FlightDataType.getType("airbrakeEvalMode", "airbrakeEvalMode", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_RHO =
+            FlightDataType.getType("airbrakeLocalRho", "airbrakeLocalRho", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_DYNP =
+            FlightDataType.getType("airbrakeLocalDynP", "airbrakeLocalDynP", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_BASELINE_CD =
+            FlightDataType.getType("airbrakeBaselineCd", "airbrakeBaselineCd", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_DELTA_CD =
+            FlightDataType.getType("airbrakeDeltaCd", "airbrakeDeltaCd", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_FINAL_CD =
+            FlightDataType.getType("airbrakeFinalCd", "airbrakeFinalCd", UnitGroup.UNITS_COEFFICIENT);
+    private static final FlightDataType AIRBRAKE_FINAL_CD_AXIAL =
+            FlightDataType.getType("airbrakeFinalCdAxial", "airbrakeFinalCdAxial", UnitGroup.UNITS_COEFFICIENT);
 
     public AirbrakeSimulationListener(AirbrakeAerodynamics airbrakes,
                                       AirbrakeController controller,
@@ -104,6 +122,8 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         if (fdb != null) {
             fdb.setValue(AIRBRAKE_EXT, 0.0);
             fdb.setValue(PRED_APOGEE, Double.NaN);
+            writeAeroDiagnostics(fdb, Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN,
+                    Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN);
         }
 
         log.info("Simulation started - initial time: {}, airbrakes retracted", lastTime);
@@ -219,6 +239,28 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             log.debug("Apogee(pred)=N/A (predictor not ready)");
         }
 
+        if (config != null && config.isDebugEnabled() && config.isDbgAlwaysOpen()) {
+            final double forced = config.getDbgForcedDeployFrac() >= 0.5 && isExtensionAllowed(status) ? 1.0 : 0.0;
+            setExt(forced);
+            if (fdb != null) {
+                fdb.setValue(AIRBRAKE_EXT, this.ext);
+            }
+            log.debug("Debug forced deployment active: requested={} applied={}",
+                    config.getDbgForcedDeployFrac(), this.ext);
+            return true;
+        }
+
+        if (config != null && config.isAlwaysOpenMode()) {
+            final double requested = config.getAlwaysOpenPercentage() >= 0.5 && isExtensionAllowed(status) ? 1.0 : 0.0;
+            setExt(requested);
+            if (fdb != null) {
+                fdb.setValue(AIRBRAKE_EXT, this.ext);
+            }
+            log.debug("Always-open mode active: requested={} applied={}",
+                    config.getAlwaysOpenPercentage(), this.ext);
+            return true;
+        }
+
         // Burnout-only override
         if (config != null && config.isDeployAfterBurnoutOnly()) {
             final double delay = Math.max(0.0, config.getDeployAfterBurnoutDelayS());
@@ -229,9 +271,9 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             } else {
                 final double dtSinceBurnout = t - burnoutTimeS;
                 if (dtSinceBurnout >= delay) {
-                    airbrake_ext_override = 1.0;
-                    log.debug("Override active: burnout+delay reached (dtSinceBurnout={} >= delay={}) → EXTEND",
-                              dtSinceBurnout, delay);
+                    airbrake_ext_override = isExtensionAllowed(status) ? 1.0 : 0.0;
+                    log.debug("Override active: burnout+delay reached (dtSinceBurnout={} >= delay={}) => ext={}",
+                              dtSinceBurnout, delay, airbrake_ext_override);
                 } else {
                     airbrake_ext_override = 0.0;
                     log.debug("Override active: within delay (dtSinceBurnout={} < delay={}) → RETRACT",
@@ -250,14 +292,21 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         double airbrake_ext;
         if (isExtensionAllowed(status)) {
             final double targetAGL = (config != null) ? config.getTargetApogee() : Double.POSITIVE_INFINITY;
+            final double toleranceM = (config != null) ? Math.max(0.0, config.getApogeeToleranceMeters()) : 0.0;
 
             if (apUsedAGL == null || !Double.isFinite(apUsedAGL)) {
                 airbrake_ext = 0.0;
                 log.debug("Predictor not ready; retracting by default");
             } else {
-                airbrake_ext = (apUsedAGL > targetAGL) ? 1.0 : 0.0;
-                log.debug("Control decision: apUsedAGL={} targetAGL={} => airbrake_ext={}",
-                          apUsedAGL, targetAGL, airbrake_ext);
+                if (apUsedAGL > targetAGL + toleranceM) {
+                    airbrake_ext = 1.0;
+                } else if (apUsedAGL < targetAGL - toleranceM) {
+                    airbrake_ext = 0.0;
+                } else {
+                    airbrake_ext = this.ext;
+                }
+                log.debug("Control decision: apUsedAGL={} targetAGL={} toleranceM={} => airbrake_ext={}",
+                          apUsedAGL, targetAGL, toleranceM, airbrake_ext);
             }
         } else {
             airbrake_ext = 0.0;
@@ -310,26 +359,32 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
             return forces;
         }
 
-        final double mach = flightConditions.getMach();
-
         final double altitudeMSL = status.getRocketPosition().z +
                 status.getSimulationConditions().getLaunchSite().getAltitude();
 
-        final double rhoDyn = AirDensity.rhoForDynamicPressure(altitudeMSL, mach);
-        final double dynP = 0.5 * rhoDyn * v2;
-
-        final double rocket_area = flightConditions.getRefArea();
-        double airbrakes_area = (config != null ? config.getReferenceArea() : 0.0);
-        if (airbrakes_area <= 0.0) {
-            airbrakes_area = airbrakesAreaFallback;
+        final double mach = AirDensity.machFromV(speed, altitudeMSL);
+        final double machMaxModel = (config != null) ? config.getMaxMachForAerodynamicModel() : 5.0;
+        if (!Double.isFinite(mach) || mach > machMaxModel) {
+            log.warn("Airbrake aero failed closed: Mach {} exceeds model limit {}", mach, machMaxModel);
+            return forces;
         }
 
+        final double rhoDyn = AirDensity.rhoForDynamicPressure(altitudeMSL, mach);
+        final double dynP = AirDensity.dynamicPressureIncompressible(altitudeMSL, speed);
+
+        final double rocket_area = flightConditions.getRefArea();
         final FlightDataBranch fdb = status.getFlightDataBranch();
         double airbrakeExt = (fdb != null ? fdb.getLast(AIRBRAKE_EXT) : this.ext);
         if (!Double.isFinite(airbrakeExt)) airbrakeExt = this.ext;
         airbrakeExt = (airbrakeExt >= 0.5) ? 1.0 : 0.0;
 
-        final double dragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
+        double deltaDragForceN_airbrakes = airbrakes.calculateDragForce(airbrakeExt, speed, altitudeMSL);
+        if (deltaDragForceN_airbrakes < 0.0 && (config == null || !config.isAllowNegativeDeltaDrag())) {
+            log.warn("Airbrake delta drag failed closed in listener: negative {} N while allowNegativeDeltaDrag=false",
+                    deltaDragForceN_airbrakes);
+            deltaDragForceN_airbrakes = 0.0;
+        }
+        final var eval = airbrakes.getLastEvaluation();
 
         final double cd_roc_axial = forces.getCDaxial();
         final double dragForceN_roc_axial = cd_roc_axial * dynP * rocket_area;
@@ -337,24 +392,37 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         final double cd_roc = forces.getCD();
         final double dragForceN_roc = cd_roc * dynP * rocket_area;
 
-        log.debug("Airbrakes Drag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={})",
-                  dragForceN_airbrakes, airbrakeExt, dragForceN_roc_axial, speed, vz, altitudeMSL);
+        log.debug("Airbrakes DeltaDrag = {} N at ext={}, Rocket Drag = {} N (speed={} m/s, vz={} m/s, altMSL={}, mach={}, evalMode={}, evalReason={})",
+                  deltaDragForceN_airbrakes, airbrakeExt, dragForceN_roc_axial, speed, vz, altitudeMSL,
+                  mach, eval.mode(), eval.reason());
 
         if (dynP <= 0 || rocket_area <= 0) {
             log.debug("dynP={} or rocket_area={} non-positive; skipping aero override", dynP, rocket_area);
             return forces;
         }
 
-        final double combinedArea = rocket_area + Math.max(0.0, airbrakes_area);
+        double drag_total_axial = dragForceN_roc_axial + deltaDragForceN_airbrakes;
+        double drag_total = dragForceN_roc + deltaDragForceN_airbrakes;
 
-        double drag_total_axial = dragForceN_roc_axial + dragForceN_airbrakes;
-        double drag_total = dragForceN_roc + dragForceN_airbrakes;
-
-        final double Cd_total_axial = drag_total_axial / (dynP * combinedArea);
-        final double Cd_total = drag_total / (dynP * combinedArea);
+        final double minTotalCd = (config != null) ? config.getMinTotalCd() : 0.0;
+        double Cd_total_axial = drag_total_axial / (dynP * rocket_area);
+        double Cd_total = drag_total / (dynP * rocket_area);
+        final double unclampedCdAxial = Cd_total_axial;
+        final double unclampedCd = Cd_total;
+        Cd_total_axial = Math.max(minTotalCd, Cd_total_axial);
+        Cd_total = Math.max(minTotalCd, Cd_total);
+        if (Cd_total_axial != unclampedCdAxial || Cd_total != unclampedCd) {
+            log.warn("Airbrake Cd clamped to minTotalCd={}: CDaxial {} -> {}, CD {} -> {}",
+                    minTotalCd, unclampedCdAxial, Cd_total_axial, unclampedCd, Cd_total);
+        }
+        final double deltaCd = deltaDragForceN_airbrakes / (dynP * rocket_area);
 
         forces.setCDaxial(Cd_total_axial);
         forces.setCD(Cd_total);
+        if (fdb != null) {
+            writeAeroDiagnostics(fdb, mach, airbrakeExt, deltaDragForceN_airbrakes, eval.mode().ordinal(),
+                    rhoDyn, dynP, cd_roc, deltaCd, Cd_total, Cd_total_axial);
+        }
 
         if (fdb != null) {
             final double apAGL = fdb.getLast(PRED_APOGEE);
@@ -368,5 +436,29 @@ public final class AirbrakeSimulationListener extends AbstractSimulationListener
         }
 
         return forces;
+    }
+
+    private static void writeAeroDiagnostics(FlightDataBranch fdb,
+                                             double mach,
+                                             double deploy,
+                                             double deltaForceN,
+                                             double evalModeCode,
+                                             double rho,
+                                             double dynP,
+                                             double baselineCd,
+                                             double deltaCd,
+                                             double finalCd,
+                                             double finalCdAxial) {
+        if (fdb == null) return;
+        fdb.setValue(AIRBRAKE_MACH, mach);
+        fdb.setValue(AIRBRAKE_EXT, deploy);
+        fdb.setValue(AIRBRAKE_DELTA_FORCE, deltaForceN);
+        fdb.setValue(AIRBRAKE_EVAL_MODE, evalModeCode);
+        fdb.setValue(AIRBRAKE_RHO, rho);
+        fdb.setValue(AIRBRAKE_DYNP, dynP);
+        fdb.setValue(AIRBRAKE_BASELINE_CD, baselineCd);
+        fdb.setValue(AIRBRAKE_DELTA_CD, deltaCd);
+        fdb.setValue(AIRBRAKE_FINAL_CD, finalCd);
+        fdb.setValue(AIRBRAKE_FINAL_CD_AXIAL, finalCdAxial);
     }
 }

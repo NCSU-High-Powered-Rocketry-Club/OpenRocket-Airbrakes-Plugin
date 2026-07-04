@@ -1,5 +1,7 @@
 package com.airbrakesplugin;
 
+import com.airbrakesplugin.util.HighMachExtrapolationMode;
+
 /**
  * Configuration container for the air-brake plugin.
  * <p>
@@ -23,6 +25,11 @@ public class AirbrakeConfig {
     // Target & safety gates
     private double  targetApogee;
     private double  maxMachForDeployment;
+    private HighMachExtrapolationMode highMachExtrapolationMode;
+    private boolean allowNegativeDeltaDrag;
+    private double minTotalCd;
+    private double maxMachForAerodynamicModel;
+    private double maxExtrapolatedForceMultiplier;
 
     // Bang-bang controller options
     private boolean alwaysOpenMode;
@@ -54,7 +61,12 @@ public class AirbrakeConfig {
         this.referenceLength = 0.0;          // m
         this.maxDeploymentRate = 40.0;       // 1/s (fraction per second)
         this.targetApogee = 0.0;             // m AGL
-        this.maxMachForDeployment = 1.0;     // cap for supersonic
+        this.maxMachForDeployment = 5.0;     // Mach 5 boundary high-speed coverage
+        this.highMachExtrapolationMode = HighMachExtrapolationMode.BOUNDED_NONLINEAR;
+        this.allowNegativeDeltaDrag = false;
+        this.minTotalCd = 0.0;
+        this.maxMachForAerodynamicModel = 5.0;
+        this.maxExtrapolatedForceMultiplier = 2.0;
         this.alwaysOpenMode = false;
         this.alwaysOpenPercentage = 1;       // 0–1
         this.apogeeToleranceMeters = null;
@@ -83,6 +95,39 @@ public class AirbrakeConfig {
 
     public double getMaxMachForDeployment()          { return maxMachForDeployment; }
     public void   setMaxMachForDeployment(double m)  { this.maxMachForDeployment = m; }
+
+    public HighMachExtrapolationMode getHighMachExtrapolationMode() {
+        return highMachExtrapolationMode == null ? HighMachExtrapolationMode.BOUNDED_NONLINEAR : highMachExtrapolationMode;
+    }
+    public void setHighMachExtrapolationMode(HighMachExtrapolationMode mode) {
+        this.highMachExtrapolationMode = mode == null ? HighMachExtrapolationMode.BOUNDED_NONLINEAR : mode;
+    }
+    public void setHighMachExtrapolationMode(String mode) {
+        this.highMachExtrapolationMode = HighMachExtrapolationMode.fromString(mode);
+    }
+
+    public boolean isAllowNegativeDeltaDrag() { return allowNegativeDeltaDrag; }
+    public void setAllowNegativeDeltaDrag(boolean allowNegativeDeltaDrag) {
+        this.allowNegativeDeltaDrag = allowNegativeDeltaDrag;
+    }
+
+    public double getMinTotalCd() { return minTotalCd; }
+    public void setMinTotalCd(double minTotalCd) {
+        this.minTotalCd = Double.isFinite(minTotalCd) ? Math.max(0.0, minTotalCd) : 0.0;
+    }
+
+    public double getMaxMachForAerodynamicModel() { return maxMachForAerodynamicModel; }
+    public void setMaxMachForAerodynamicModel(double maxMachForAerodynamicModel) {
+        this.maxMachForAerodynamicModel = (Double.isFinite(maxMachForAerodynamicModel) && maxMachForAerodynamicModel > 0.0)
+                ? maxMachForAerodynamicModel : 5.0;
+    }
+
+    public double getMaxExtrapolatedForceMultiplier() { return maxExtrapolatedForceMultiplier; }
+    public void setMaxExtrapolatedForceMultiplier(double maxExtrapolatedForceMultiplier) {
+        this.maxExtrapolatedForceMultiplier =
+                (Double.isFinite(maxExtrapolatedForceMultiplier) && maxExtrapolatedForceMultiplier >= 1.0)
+                        ? maxExtrapolatedForceMultiplier : 2.0;
+    }
 
     // Bang-bang related
     public boolean isAlwaysOpenMode()                { return alwaysOpenMode; }
@@ -149,6 +194,11 @@ public class AirbrakeConfig {
                 ", maxDeploymentRate=" + maxDeploymentRate +
                 ", targetApogee=" + targetApogee +
                 ", maxMachForDeployment=" + maxMachForDeployment +
+                ", highMachExtrapolationMode=" + getHighMachExtrapolationMode() +
+                ", allowNegativeDeltaDrag=" + allowNegativeDeltaDrag +
+                ", minTotalCd=" + minTotalCd +
+                ", maxMachForAerodynamicModel=" + maxMachForAerodynamicModel +
+                ", maxExtrapolatedForceMultiplier=" + maxExtrapolatedForceMultiplier +
                 ", alwaysOpenMode=" + alwaysOpenMode +
                 ", alwaysOpenPercentage=" + alwaysOpenPercentage +
                 ", apogeeToleranceMeters=" + apogeeToleranceMeters +

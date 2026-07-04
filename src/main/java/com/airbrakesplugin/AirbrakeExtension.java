@@ -1,5 +1,6 @@
 package com.airbrakesplugin;
 
+import com.airbrakesplugin.util.HighMachExtrapolationMode;
 import com.airbrakesplugin.util.ApogeePredictor;
 import info.openrocket.core.simulation.SimulationConditions;
 import info.openrocket.core.simulation.exception.SimulationException;
@@ -48,6 +49,11 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     private static final String K_MAX_DEPLOYMENT_RATE      = CFG_PREFIX + "maxDeploymentRate";
     private static final String K_TARGET_APOGEE            = CFG_PREFIX + "targetApogee";
     private static final String K_MAX_MACH_FOR_DEPLOYMENT  = CFG_PREFIX + "maxMachForDeployment";
+    private static final String K_HIGH_MACH_EXTRAP_MODE    = CFG_PREFIX + "highMachExtrapolationMode";
+    private static final String K_ALLOW_NEGATIVE_DELTA     = CFG_PREFIX + "allowNegativeDeltaDrag";
+    private static final String K_MIN_TOTAL_CD             = CFG_PREFIX + "minTotalCd";
+    private static final String K_MAX_MACH_AERO_MODEL      = CFG_PREFIX + "maxMachForAerodynamicModel";
+    private static final String K_MAX_EXTRAP_FORCE_MULT    = CFG_PREFIX + "maxExtrapolatedForceMultiplier";
     private static final String K_ALWAYS_OPEN_MODE         = CFG_PREFIX + "alwaysOpenMode";
     private static final String K_ALWAYS_OPEN_PERCENT      = CFG_PREFIX + "alwaysOpenPercentage";
     private static final String K_APOGEE_TOLERANCE_M        = CFG_PREFIX + "apogeeToleranceMeters";
@@ -71,6 +77,11 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     private static final String K_MAX_DEPLOYMENT_RATE_LEGACY     = "maxDeploymentRate";
     private static final String K_TARGET_APOGEE_LEGACY           = "targetApogee";
     private static final String K_MAX_MACH_FOR_DEPLOYMENT_LEGACY = "maxMachForDeployment";
+    private static final String K_HIGH_MACH_EXTRAP_MODE_LEGACY   = "highMachExtrapolationMode";
+    private static final String K_ALLOW_NEGATIVE_DELTA_LEGACY    = "allowNegativeDeltaDrag";
+    private static final String K_MIN_TOTAL_CD_LEGACY            = "minTotalCd";
+    private static final String K_MAX_MACH_AERO_MODEL_LEGACY     = "maxMachForAerodynamicModel";
+    private static final String K_MAX_EXTRAP_FORCE_MULT_LEGACY   = "maxExtrapolatedForceMultiplier";
     private static final String K_ALWAYS_OPEN_MODE_LEGACY        = "alwaysOpenMode";
     private static final String K_ALWAYS_OPEN_PERCENT_LEGACY     = "alwaysOpenPercentage";
     private static final String K_APOGEE_TOLERANCE_M_LEGACY       = "apogeeToleranceMeters";
@@ -91,7 +102,12 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
     private static final double D_REFERENCE_LENGTH = 0.0;
     private static final double D_MAX_DEPLOYMENT_RATE = 40.0;
     private static final double D_TARGET_APOGEE = 0.0;
-    private static final double D_MAX_MACH_FOR_DEPLOYMENT = 1.0;
+    private static final double D_MAX_MACH_FOR_DEPLOYMENT = 5.0;
+    private static final String D_HIGH_MACH_EXTRAP_MODE = HighMachExtrapolationMode.BOUNDED_NONLINEAR.name();
+    private static final boolean D_ALLOW_NEGATIVE_DELTA = false;
+    private static final double D_MIN_TOTAL_CD = 0.0;
+    private static final double D_MAX_MACH_AERO_MODEL = 5.0;
+    private static final double D_MAX_EXTRAP_FORCE_MULT = 2.0;
     private static final boolean D_ALWAYS_OPEN_MODE = false;
     private static final double D_ALWAYS_OPEN_PERCENT = 1.0;
     private static final double D_APOGEE_TOLERANCE_M = 5.0;
@@ -271,6 +287,11 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
             runtimeCfg.setMaxDeploymentRate(getMaxDeploymentRate());
             runtimeCfg.setTargetApogee(getTargetApogee());
             runtimeCfg.setMaxMachForDeployment(getMaxMachForDeployment());
+            runtimeCfg.setHighMachExtrapolationMode(getHighMachExtrapolationMode());
+            runtimeCfg.setAllowNegativeDeltaDrag(isAllowNegativeDeltaDrag());
+            runtimeCfg.setMinTotalCd(getMinTotalCd());
+            runtimeCfg.setMaxMachForAerodynamicModel(getMaxMachForAerodynamicModel());
+            runtimeCfg.setMaxExtrapolatedForceMultiplier(getMaxExtrapolatedForceMultiplier());
             runtimeCfg.setAlwaysOpenMode(isAlwaysOpenMode());
             runtimeCfg.setAlwaysOpenPercentage(getAlwaysOpenPercentage());
             runtimeCfg.setApogeeToleranceMeters(getApogeeToleranceMeters());
@@ -287,7 +308,7 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
             runtimeCfg.setDbgShowConsole(isDbgShowConsole());
 
             // Aerobrake aerodynamics from CFD file
-            final AirbrakeAerodynamics airbrakes = new AirbrakeAerodynamics(runtimeCfg.getCfdDataFilePath());
+            final AirbrakeAerodynamics airbrakes = new AirbrakeAerodynamics(runtimeCfg);
 
             // RK4 apogee predictor (pure vertical model)
             final ApogeePredictor predictor = new ApogeePredictor();
@@ -300,6 +321,7 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
             };
 
             final AirbrakeController controller = new AirbrakeController(runtimeCfg.getTargetApogee(), predictor, noopCtx);
+            controller.setApogeeDeadbandMeters(runtimeCfg.getApogeeToleranceMeters());
 
             // Reference area fallback for ΔCD conversion
             final double refAreaFallback = Math.max(1e-9, runtimeCfg.getReferenceArea());
@@ -389,6 +411,57 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
 
     public void setMaxMachForDeployment(double m) {
         cfgPutDouble(K_MAX_MACH_FOR_DEPLOYMENT, m);
+        fireChangeEvent();
+    }
+
+    public HighMachExtrapolationMode getHighMachExtrapolationMode() {
+        return HighMachExtrapolationMode.fromString(
+                cfgString(K_HIGH_MACH_EXTRAP_MODE, K_HIGH_MACH_EXTRAP_MODE_LEGACY, D_HIGH_MACH_EXTRAP_MODE));
+    }
+
+    public void setHighMachExtrapolationMode(HighMachExtrapolationMode mode) {
+        cfgPutString(K_HIGH_MACH_EXTRAP_MODE,
+                (mode == null ? HighMachExtrapolationMode.BOUNDED_NONLINEAR : mode).name());
+        fireChangeEvent();
+    }
+
+    public boolean isAllowNegativeDeltaDrag() {
+        return cfgBool(K_ALLOW_NEGATIVE_DELTA, K_ALLOW_NEGATIVE_DELTA_LEGACY, D_ALLOW_NEGATIVE_DELTA);
+    }
+
+    public void setAllowNegativeDeltaDrag(boolean v) {
+        cfgPutBool(K_ALLOW_NEGATIVE_DELTA, v);
+        fireChangeEvent();
+    }
+
+    public double getMinTotalCd() {
+        return Math.max(0.0, cfgDouble(K_MIN_TOTAL_CD, K_MIN_TOTAL_CD_LEGACY, D_MIN_TOTAL_CD));
+    }
+
+    public void setMinTotalCd(double v) {
+        cfgPutDouble(K_MIN_TOTAL_CD, Double.isFinite(v) ? Math.max(0.0, v) : D_MIN_TOTAL_CD);
+        fireChangeEvent();
+    }
+
+    public double getMaxMachForAerodynamicModel() {
+        double v = cfgDouble(K_MAX_MACH_AERO_MODEL, K_MAX_MACH_AERO_MODEL_LEGACY, D_MAX_MACH_AERO_MODEL);
+        return (Double.isFinite(v) && v > 0.0) ? v : D_MAX_MACH_AERO_MODEL;
+    }
+
+    public void setMaxMachForAerodynamicModel(double v) {
+        cfgPutDouble(K_MAX_MACH_AERO_MODEL,
+                (Double.isFinite(v) && v > 0.0) ? v : D_MAX_MACH_AERO_MODEL);
+        fireChangeEvent();
+    }
+
+    public double getMaxExtrapolatedForceMultiplier() {
+        double v = cfgDouble(K_MAX_EXTRAP_FORCE_MULT, K_MAX_EXTRAP_FORCE_MULT_LEGACY, D_MAX_EXTRAP_FORCE_MULT);
+        return (Double.isFinite(v) && v >= 1.0) ? v : D_MAX_EXTRAP_FORCE_MULT;
+    }
+
+    public void setMaxExtrapolatedForceMultiplier(double v) {
+        cfgPutDouble(K_MAX_EXTRAP_FORCE_MULT,
+                (Double.isFinite(v) && v >= 1.0) ? v : D_MAX_EXTRAP_FORCE_MULT);
         fireChangeEvent();
     }
 
@@ -522,6 +595,11 @@ public class AirbrakeExtension extends AbstractSimulationExtension {
                 ", maxDeploymentRate=" + getMaxDeploymentRate() +
                 ", targetApogee=" + getTargetApogee() +
                 ", maxMachForDeployment=" + getMaxMachForDeployment() +
+                ", highMachExtrapolationMode=" + getHighMachExtrapolationMode() +
+                ", allowNegativeDeltaDrag=" + isAllowNegativeDeltaDrag() +
+                ", minTotalCd=" + getMinTotalCd() +
+                ", maxMachForAerodynamicModel=" + getMaxMachForAerodynamicModel() +
+                ", maxExtrapolatedForceMultiplier=" + getMaxExtrapolatedForceMultiplier() +
                 ", alwaysOpenMode=" + isAlwaysOpenMode() +
                 ", alwaysOpenPercentage=" + getAlwaysOpenPercentage() +
                 ", apogeeToleranceMeters=" + getApogeeToleranceMeters() +
